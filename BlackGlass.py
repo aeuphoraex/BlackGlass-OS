@@ -371,8 +371,8 @@ class Constraints:
         # Only essential ones for this script's functionality are defined here for brevity
         self.CHAT_NORMAL = 1
         # NEW CHAT CONSTANTS FOR FILTERING
-        self.CHAT_START_TYPING = 39 
-        self.CHAT_STOP_TYPING = 40
+        self.CHAT_START_TYPING = 4 
+        self.CHAT_STOP_TYPING = 5
         
         # New/Expanded Movement Control Flags (U32)
         # These are used in the AgentUpdate packet's ControlFlags field
@@ -405,6 +405,7 @@ elif sys.platform == "darwin": __PLATFORM_STRING__ = "Mac"
 
 # This is the correct, default login URI from the pyverse authentication.py file
 LOGIN_URI = "https://login.agni.lindenlab.com/cgi-bin/login.cgi" 
+SL_USER_AGENT = "Firestorm-Releasex64/7.1.9.74745 (Second Life; Intel; Windows)"
 
 def login_to_simulator(firstname, lastname, password, mac=None, start="last", grid=None):
     if grid is None: grid = LOGIN_URI
@@ -418,15 +419,16 @@ def login_to_simulator(firstname, lastname, password, mac=None, start="last", gr
         "first": firstname,
         "last": lastname,
         "passwd": "$1$"+hashlib.md5(password.encode("latin")).hexdigest(),
-        "start": start, # This is the critical parameter
-        "channel": "SLViewer_Py", 
-        "version": "Python "+sys.version,
+        "start": start,
         "platform": __PLATFORM_STRING__,
         "mac": mac,
         "id0": hashlib.md5(("%s:%s:%s"%(__PLATFORM_STRING__,mac,sys.version)).encode("latin")).hexdigest(),
         "agree_to_tos": True,
         "last_exec_event": 0,
-        "options": ["inventory-root", "buddy-list", "login-flags", "global-textures"]
+        "viewer_protocol_version": "2.0.0",
+        "channel": "Firestorm-Releasex64",
+        "version": "7.1.9.74745",
+        "options": ["inventory-root", "buddy-list", "login-flags", "global-textures", "display-names"]
     })
     if result["login"] != "true":
         raise ConnectionError("Unable to log in:\n    %s"%(result["message"] if "message" in result else "Unknown error"))
@@ -469,6 +471,37 @@ class BaseMessage:
             self.load(data)
     
     def load(self, data):
+        # Heuristic fix for padded ObjectUpdateCompressed packets
+        offset_shift = 0
+        if self.name == "ObjectUpdateCompressed":
+             # Check if the count at the expected offset (10) is 0, but packet is large
+             # Expected offset 10 comes from RegionData (10 bytes)
+             if len(data) > 20 and data[10] == 0:
+#                 print(f"[DEBUG] Repositioning scanner for {self.name}...")
+                 for i in range(11, min(len(data), 64)):
+                     if data[i] != 0:
+                         # Found potential count
+#                         print(f"[DEBUG] Found non-zero byte {data[i]} at offset {i}. shifting...")
+                         # We need the scanner to arrive at 'i' when it wants to read the count.
+                         # The scanner is at 'offset' (which tracks key processing).
+                         # We can't easily change the loop behavior, but we can slide the data?
+                         # Or simpler: The scanner logic below uses 'offset'.
+                         # We can artificially increase 'offset' IF we are processing ObjectDate (key[1]==0).
+                         
+                         # Actually, we can just detect the padding and consume it explicitly?
+                         # But the structure is rigid.
+                         
+                         # Strategy: If we are here, we modify 'data' to remove padding?
+                         # No, 'RegionData' needs 10 bytes. The padding is AFTER RegionData?
+                         # i = new offset for count.
+                         # expected = 10.
+                         # padding = i - 10.
+                         
+                         # found potential count
+                         offset_shift = i - 10
+#                          print(f"[DEBUG] Shift detected: {offset_shift}. New count byte: {data[i]}")
+                         break
+                         
         offset = 0
         for key in self.blocks:
             if key[1] == 1:
@@ -492,6 +525,12 @@ class BaseMessage:
                     offset += tlen
                 setattr(self, key[0], tmp)
             else: # Variable count blocks (key[1] == 0) or Fixed count blocks (key[1] > 1)
+                
+                # Apply heuristic shift if this is the variable block and we detected padding
+                if self.name == "ObjectUpdateCompressed" and key[1] == 0 and offset_shift > 0:
+#                     print(f"[DEBUG] Applying offset shift {offset_shift} for ObjectData...")
+                    offset += offset_shift
+                
                 count = key[1]
                 if count == 0: # Variable count (always U8)
                     count = struct.unpack_from(">B", data, offset)[0]; offset += 1
@@ -566,7 +605,10 @@ class CompleteAgentMovement(BaseMessage):
 registerMessage(CompleteAgentMovement)
 
 class RegionHandshake(BaseMessage):
-    name = "RegionHandshake"; id = 148; freq = 2; trusted = True; zero_coded = True
+    # FIX: RegionHandshake is LowFrequency (2), ID is 0x105 (261)
+    # The previous ID 148 was incorrect for usage as LowFrequency ID 261?
+    # Actually, let's trust the PACKET ERROR log which looked for 4294902021 (0xFFFF0105).
+    name = "RegionHandshake"; id = 261; freq = 2; trusted = True; zero_coded = True
     blocks = [("RegionInfo", 1), ("RegionInfo2", 1), ("RegionInfo3", 1), ("RegionInfo4", 0)]
     structure = {
         "RegionInfo": [("RegionFlags", "U32"), ("SimAccess", "U8"), ("SimName", "Variable", 1), ("SimOwner", "LLUUID"), ("IsEstateManager", "BOOL"), ("WaterHeight", "F32"), ("BillableFactor", "F32"), ("CacheID", "LLUUID"), ("TerrainBase0", "LLUUID"), ("TerrainBase1", "LLUUID"), ("TerrainBase2", "LLUUID"), ("TerrainBase3", "LLUUID"), ("TerrainDetail0", "LLUUID"), ("TerrainDetail1", "LLUUID"), ("TerrainDetail2", "LLUUID"), ("TerrainDetail3", "LLUUID"), ("TerrainStartHeight00", "F32"), ("TerrainStartHeight01", "F32"), ("TerrainStartHeight10", "F32"), ("TerrainStartHeight11", "F32"), ("TerrainHeightRange00", "F32"), ("TerrainHeightRange01", "F32"), ("TerrainHeightRange10", "F32"), ("TerrainHeightRange11", "F32")],
@@ -723,30 +765,6 @@ registerMessage(MapItemReply)
 
 # --- Object/Self Position Update Messages (For Minimap) ---
 
-class CoarseLocationUpdate(BaseMessage):
-    name = "CoarseLocationUpdate"; id = 234; freq = 2; trusted = True; zero_coded = True
-    blocks = [("Location", 0), ("Index", 1), ("AgentData", 0)]
-    structure = {
-        "Location": [("X", "U8"), ("Y", "U8"), ("Z", "U8")],
-        "Index": [("You", "S16"), ("PreYou", "S16")],
-        "AgentData": [("AgentID", "LLUUID")]
-    }
-registerMessage(CoarseLocationUpdate)
-
-class ObjectUpdate(BaseMessage):
-    name = "ObjectUpdate"; id = 4294967295; freq = 3; trusted = True; zero_coded = True
-    blocks = [("RegionData", 1), ("ObjectData", 0)]
-    structure = {
-        "RegionData": [("RegionHandle", "U64"), ("TimeDilation", "U16")],
-        "ObjectData": [
-            ("ID", "U32"), ("State", "U8"), ("FullID", "LLUUID"), ("CRC", "U32"),
-            ("PCode", "U8"), ("Material", "U8"), ("ClickAction", "U8"), ("Scale", "LLVector3"),
-            ("ObjectData", "Variable", 1), ("ParentID", "U32"), ("UpdateFlags", "U32"),
-            ("Data", "Variable", 1)
-        ]
-    }
-registerMessage(ObjectUpdate)
-
 class ImprovedTerseObjectUpdate(BaseMessage):
     name = "ImprovedTerseObjectUpdate"; id = 4294967292; freq = 3; trusted = False; zero_coded = True
     blocks = [("RegionData", 1), ("ObjectData", 0)]
@@ -755,10 +773,63 @@ class ImprovedTerseObjectUpdate(BaseMessage):
         "ObjectData": [
             ("ID", "U32"), 
             ("CRC", "U32"),
-            ("Data", "Fixed", 46) # Variable length data block containing position/rotation/etc.
+            ("Data", "Variable", 1) # Variable length data block containing position/rotation/etc.
         ]
     }
 registerMessage(ImprovedTerseObjectUpdate)
+
+class ObjectUpdate(BaseMessage):
+    # FIX: Frequency is 0 (High Priority / 1-byte ID) for ObjectUpdate (ID 16)
+    name = "ObjectUpdate"; id = 16; freq = 0; trusted = True; zero_coded = True
+    blocks = [("RegionData", 1), ("ObjectData", 0)]
+    structure = {
+        "RegionData": [("RegionHandle", "U64"), ("TimeDilation", "U16")],
+        "ObjectData": [
+            ("ID", "U32"), ("State", "U8"), ("FullID", "LLUUID"), ("CRC", "U32"), ("PCode", "U8"),
+            ("Material", "U8"), ("ClickAction", "U8"), ("Scale", "LLVector3"), ("ObjectData", "Variable", 1),
+            ("ParentID", "U32"), ("UpdateFlags", "U32"), ("PathCurve", "U8"), ("ProfileCurve", "U8"),
+            ("PathBegin", "U16"), ("PathEnd", "U16"), ("PathScaleX", "U8"), ("PathScaleY", "U8"),
+            ("PathShearX", "U8"), ("PathShearY", "U8"), ("PathTwist", "S8"), ("PathTwistBegin", "S8"),
+            ("PathRadiusOffset", "S8"), ("PathTaperX", "S8"), ("PathTaperY", "S8"), ("PathRevolutions", "U8"),
+            ("PathSkew", "S8"), ("ProfileBegin", "U16"), ("ProfileEnd", "U16"), ("ProfileHollow", "U16"),
+            ("TextureEntry", "Variable", 2), ("TextureAnim", "Variable", 1), ("NameValue", "Variable", 1),
+            ("Data", "Variable", 2), ("Text", "Variable", 1), ("TextColor", "Color4U"),
+            ("MediaURL", "Variable", 1), ("ParticleSystem", "Variable", 1), ("ExtraParams", "Variable", 1),
+            ("Sound", "LLUUID"), ("OwnerID", "LLUUID"), ("SoundGain", "F32"), ("SoundRadius", "U8"),
+            ("SoundFlags", "U8"), ("JointType", "U8"), ("JointPivot", "LLVector3"), ("JointAxisOrAnchor", "LLVector3")
+        ]
+    }
+registerMessage(ObjectUpdate)
+
+class ObjectUpdateCompressed(BaseMessage):
+    name = "ObjectUpdateCompressed"; id = 17; freq = 1; trusted = True; zero_coded = True
+    blocks = [("RegionData", 1), ("ObjectData", 0)]
+    structure = {
+        "RegionData": [("RegionHandle", "U64"), ("TimeDilation", "U16")],
+        "ObjectData": [
+            ("UpdateFlags", "U32"), ("Data", "Variable", 1)
+        ]
+    }
+registerMessage(ObjectUpdateCompressed)
+
+class CoarseLocationUpdate(BaseMessage):
+    # FIX: Medium Frequency (1) for CoarseLocationUpdate
+    name = "CoarseLocationUpdate"; id = 6; freq = 1; trusted = False; zero_coded = False
+    blocks = [("Location", 0), ("Index", 0)]
+    structure = {
+        "Location": [("X", "U8"), ("Y", "U8"), ("Z", "U8")],
+        "Index": [("You", "S16"), ("Prey", "S16")]
+    }
+registerMessage(CoarseLocationUpdate)
+
+class ImagePacket(BaseMessage):
+    name = "ImagePacket"; id = 11; freq = 0; trusted = False; zero_coded = True
+    blocks = [("ImageID", 1), ("ImageData", 1)]
+    structure = {
+        "ImageID": [("ID", "LLUUID"), ("Codec", "U8"), ("Packet", "U16"), ("Packets", "U16")],
+        "ImageData": [("Data", "Variable", 2)]
+    }
+registerMessage(ImagePacket)
 
 # --- KICKUSER PACKET ---
 class KickUser(BaseMessage):
@@ -838,7 +909,18 @@ class Packet:
             else: # High or Fixed
                 realID = mid_raw # mid_raw already has the 0xFFFF prefix if 4 bytes
             # Use the determined offset to get the body data
+            # DEBUG: Print exact ID resolution
+            # print(f"[PACKET DEBUG] MID Raw: {mid_raw} RealID: {realID}")
+            
             self.body = getMessageByID(realID, self.bytes[offset:])
+            
+            # DEBUG: Diagnose missing body
+            if self.body is None:
+#                  print(f"[PACKET ERROR] ID {realID} (Raw {mid_raw}) not found in lookup.")
+                 # Create a dummy body to prevent crashes in handleInternalPackets
+                 class DummyBody: name="UnknownID"
+                 self.body = DummyBody()
+
             if not self.body: 
                 self.body = type('UnknownMessage', (object,), {'name': 'Unknown'})()
 
@@ -955,6 +1037,10 @@ class RegionClient:
 
     # NEW: List to store positions of other avatars [(x, y, z), ...]
     other_avatars = []
+    
+    # NEW: Capability storage
+    capabilities = {}
+    seed_cap_url = ""
 
     # MODIFIED: Added log_callback to constructor
     def __init__(self, loginToken, host="0.0.0.0", port=0, debug=False, log_callback=None):
@@ -979,6 +1065,13 @@ class RegionClient:
         
         # The circuit_code from login token is a string (e.g., "1234567"), need to pack the integer value
         self.circuit_code = int(loginToken["circuit_code"])
+        
+        # Capture Seed Capability URL
+        self.seed_cap_url = loginToken.get("seed_capability", "")
+        # FIX: Capture all initial capabilities provided at login time
+        self.capabilities = loginToken.get("capabilities", {}).copy()
+        self.log(f"Seed Capability obtained: {self.seed_cap_url}")
+        self.log(f"Initial capabilities: {list(self.capabilities.keys())}")
 
         # Extract initial region grid coordinates (in meters) and convert to tile coordinates
         # Default is Da Boom (1000, 1000) if missing
@@ -1088,7 +1181,18 @@ class RegionClient:
 
     # MODIFIED: Logic added to trigger MAP_FETCH_TRIGGER on RegionHandshake
     def handleInternalPackets(self, pck):
-        if not hasattr(pck.body, 'name'): return
+        if not hasattr(pck.body, 'name'):
+             self.log_callback(f"[SPY] Body Invalid: {type(pck.body)}")
+             return
+            
+        if pck.body.name == "UnknownID":
+             if self.local_id == 0:
+                 self.log_callback(f"[SPY] Unrecognized ID: {pck.MID}")
+             return
+
+        # Packet Spy: Log all named packets until we find ourselves
+        if self.local_id == 0:
+             self.log_callback(f"[SPY] Packet: {pck.body.name} (ID {pck.MID})")
         
         # NEW: Process ACKs in the received packet
         for seq_id in pck.acks:
@@ -1126,78 +1230,159 @@ class RegionClient:
         elif pck.body.name == "ObjectUpdate":
             # Capture LocalID from ObjectUpdate to enable Terse updates
             for block in pck.body.ObjectData:
-                # FIX: Blocks are dictionaries, use .get()
-                full_id = block.get('FullID')
-                if full_id == self.agent_id:
+                # Check if this object is ME
+                # Note: FullID might be under 'FullID' or similar depending on the block type
+                # FIX: Use dictionary access and compare UUID bytes or string
+                full_id = block.get("FullID")
+                
+                # DIAGNOSTIC: Log all ObjectUpdate IDs to see if we are missed
+#                 print(f"[OBJ] ObjectUpdate Candidate: {full_id} vs {self.agent_id}")
+                
+                if full_id and str(full_id) == str(self.agent_id):
                     self.local_id = block["ID"]
-                    self.log_callback(f"[CHAT] Agent LocalID Captured: {self.local_id}")
+#                     print(f"[DEBUG] LocalID Captured from ObjectUpdate: {self.local_id}")
+                    self.log_callback("MINIMAP_UPDATE")
                     break
 
+        elif pck.body.name == "ObjectUpdateCompressed":
+            # Handle Compressed Updates - Try to find ourselves in the blob
+            # self.log_callback(f"[DEBUG] Received ObjectUpdateCompressed!")
+#             print(f"[DEBUG] ObjectUpdateCompressed: {len(pck.body.ObjectData)} objects")
+            
+            for block in pck.body.ObjectData:
+                 data_blob = block["Data"].data
+                 # DIAGNOSTIC: Hexdump start of blob
+#                  print(f"[COMP] Blob Len: {len(data_blob)}")
+#                  print(hexdump(data_blob[:64]))
+                 
+                 # SEARCH for our UUID in the blob
+                 search_target = self.agent_id.bytes
+                 search_target_rev = self.agent_id.bytes[::-1]
+#                  print(f"[DEBUG] Searching for AgentID: {self.agent_id} in blob ({len(data_blob)} bytes)")
+                 
+                 found_idx = -1
+                 if search_target in data_blob:
+                     found_idx = data_blob.find(search_target)
+#                      print(f"[DEBUG] FOUND AGENT UUID (Normal) at offset {found_idx}")
+                 elif search_target_rev in data_blob:
+                     found_idx = data_blob.find(search_target_rev)
+                     # If reversed, we might need to handle LocalID differently if endianness is flipped?
+#                      print(f"[DEBUG] FOUND AGENT UUID (Reversed) at offset {found_idx}")
+                 
+                 if found_idx >= 0:
+                     # Heuristic: LocalID is usually the 4 bytes BEFORE the UUID in some compressed formats, 
+                     # or part of the header. 
+                     # In ObjectUpdateCompressed, UpdateFlags are first.
+                     # Let's dump surrounding bytes to ID the LocalID.
+                     pass
+                     # The structure of ObjectData is: UpdateFlags (U32), Data (Variable).
+                     # The first field in Data IS NOT LocalID?
+                     # Wait. In libomv, ObjectUpdateCompressed.ObjectData class has:
+                     # UpdateFlags, Data.
+                     # Decompressed Data has: UUID, LocalID, PCode, etc. depending on flags.
+                     # UUID is usually near the START if it's sent.
+                     
+                     # If we found UUID at offset `idx`.
+                     # LocalID is typically *before* UUID? Or after?
+                     # Let's try to extract candidates.
+                     
+                     # Diagnostic dump around the UUID
+                     start_dump = max(0, idx - 16)
+                     end_dump = min(len(data_blob), idx + 32)
+#                      print(f"[DEBUG] Dump around UUID:\n{hexdump(data_blob[start_dump:end_dump])}")
+                     
+                     # Heuristic: If we haven't found LocalID yet, try to guess it.
+                     # Usually LocalID is U32.
+                     
+                     # If we assume this is us, let's TRY using it.
+                     # We need to find the LocalID to use Terse updates.
+                     # Let's wait for the heuristic log to tell us where it is structure-wise.
+                     pass
+            
         elif pck.body.name == "ImprovedTerseObjectUpdate":
             for block in pck.body.ObjectData:
                 # Match against the captured LocalID or heuristic
                 is_me = False
                 if self.local_id != 0:
                     is_me = (block["ID"] == self.local_id)
-                else:
-                    is_me = (block["ID"] == struct.unpack("<I", self.agent_id.bytes[:4])[0])
+                # Removed the bad fallback logic
                 
                 if is_me:
                     data = block["Data"].data 
+                    # self.log_callback(f"[DEBUG] Terse Update for ME. Len={len(data)}")
                     
                     if len(data) >= 12:
                         try:
                             # Standard Avatar Interpretation (Offset 1, 12 bytes float)
-                            if len(data) >= 13:
-                                px, py, pz = struct.unpack("<fff", data[1:13])
+                            # Or maybe Offset 0?
+                            # Try to find reasonable coordinates
+                            # Debug dump
+                            # self.log_callback(f"[DEBUG] Terse Hex: {data.hex()}")
+                            
+                            if len(data) >= 13: # Heuristic check for uncompressed
+                                px, py, pz = struct.unpack("<fff", data[0:12]) # TRY OFFSET 0
+                                # If silly values, try offset 1
+                                if px > 1000 or py > 1000:
+                                     px, py, pz = struct.unpack("<fff", data[1:13])
                                 
-                                # Process rotation if 12 bytes available after position (offset 13 + 12 = 25)
-                                if len(data) >= 25:
-                                    # Rotation is typically packed; for now, let's just log it if we can
-                                    # Radian yaw is often at a specific offset in terse updates
-                                    pass
-
                                 # Normalizing: if values are > 256, they are likely global.
                                 # Region local is always 0.0-256.0.
                                 if px > 256: px %= 256
                                 if py > 256: py %= 256
                                 
-                                self.agent_x, self.agent_y, self.agent_z = px, py, pz
-                                self.log_callback(f"[CHAT] Own Pos: {px:.1f}, {py:.1f}, {pz:.1f}")
-                                self.log_callback("MINIMAP_UPDATE")
-                            else:
-                                # Compressed Interpretation (Offset 0, 4 bytes U16)
-                                px_raw, py_raw = struct.unpack("<HH", data[0:4])
-                                px, py = px_raw / 256.0, py_raw / 256.0
                                 self.agent_x, self.agent_y = px, py
-                                self.log_callback(f"[CHAT] Own Pos (comp): {px:.1f}, {py:.1f}")
+                                # self.log_callback(f"[CHAT] Own Pos: {px:.1f}, {py:.1f}")
                                 self.log_callback("MINIMAP_UPDATE")
-                        except Exception as e:
-                            self.log_callback(f"[CHAT] Failed to parse position: {e}")
+                                break
+                            
+                            # Compressed Interpretation (Offset 0, 4 bytes U16)
+                            px_raw, py_raw = struct.unpack("<HH", data[0:4])
+                            px, py = px_raw / 256.0, py_raw / 256.0
+                            self.agent_x, self.agent_y = px, py
+                            # self.log_callback(f"[CHAT] Own Pos (comp): {px:.1f}, {py:.1f}")
+                            self.log_callback("MINIMAP_UPDATE")
+                        except:
+                            pass
                     break
         
         elif pck.body.name == "CoarseLocationUpdate":
             # Handle other avatars for minimap
             new_avatars = []
             
-            # The simulator sends a 'Location' block and an optional 'Index' block
-            # Index["You"] tells us where we are in the list.
-            locations = getattr(pck.body, 'Location', [])
-            you_index = -1
-            if hasattr(pck.body, 'Index') and len(pck.body.Index) > 0:
-                you_index = pck.body.Index[0].get('You', -1)
+            # The sim typically sends 'Location' block.
+            location_blocks = getattr(pck.body, 'Location', [])
+            if not location_blocks:
+                location_blocks = getattr(pck.body, 'AgentData', [])
             
-            for i, loc in enumerate(locations):
-                if i == you_index:
-                    continue # Skip self, we use terse updates for high precision
+            # Check for the 'Index' block to identify our own avatar
+            my_index = -1
+            index_blocks = getattr(pck.body, 'Index', [])
+            
+            if index_blocks and len(index_blocks) > 0:
+                # The 'You' field in CoarseLocationUpdate/Index is S16
+                raw_index = index_blocks[0].get("You", -1)
                 
-                # Coarse coords are U8 (0-255)
-                new_avatars.append((loc['X'], loc['Y'], loc['Z']))
+                # REVERTED HACK: Trust the raw index, but only if reasonable positive
+                if raw_index >= 0:
+                    my_index = raw_index
+#                 print(f"[COARSE DEBUG] 'You' Index: {raw_index} -> Used: {my_index} (Locs: {len(location_blocks)})")
+            
+            for i, block in enumerate(location_blocks):
+                if 'X' in block and 'Y' in block:
+                    x = block['X']
+                    y = block['Y']
+                    z = block.get('Z', 0)
+                    
+                    # Fix: Ensure my_index is an int and compare correctly
+                    if i == int(my_index):
+                        # print(f"[COARSE DEBUG] Updating SELF pos: {x}, {y}")
+                        # We use Coarse as a fallback for self pos
+                        self.agent_x = float(x)
+                        self.agent_y = float(y)
+                    else:
+                        new_avatars.append((x, y, z))
                 
             self.other_avatars = new_avatars
-            # Only log if there are actually avatars to avoid spam
-            if len(self.other_avatars) > 0:
-                self.log_callback(f"[CHAT] Received {len(self.other_avatars)} avatar dots.")
             self.log_callback("MINIMAP_UPDATE")
 
         elif pck.body.name == "StartPingCheck":
@@ -1240,10 +1425,16 @@ class RegionClient:
             # --- END FIX ---
             
         # --- KICKUSER HANDLING (NEW) ---
-        elif pck.body.name == "KickUser":
             reason = safe_decode_llvariable(pck.body.TargetBlock.get('Reason', 'Unknown reason from sim.'))
             self.log_callback("KICKED", reason)
         # --- END KICKUSER HANDLING ---
+
+        elif pck.body.name == "TeleportFinish":
+            # Update seed capability if available in TeleportFinish
+            if hasattr(pck.body, 'Info'):
+                self.seed_cap_url = safe_decode_llvariable(pck.body.Info.get("SeedCapability", ""))
+                self.capabilities = {} # Reset caps for the new region
+                self.log(f"Updated Seed Capability to {self.seed_cap_url}")
 
         if pck.reliable:
             self.acks.append(pck.sequence)
@@ -1262,6 +1453,10 @@ class RegionClient:
                 if self.debug: self.log_callback(f"ERROR: Packet deserialization error: {e}")
                 if self.debug: self.log_callback(packetErrorTrace(blob))
                 return None
+            
+            # DIAGNOSTIC: Log processed packet ID
+#             print(f"[RAW-RECV] MID: {pck.MID}, Name: {pck.body.name}, Freq: {getattr(pck.body, 'freq', '?')}")
+            
             self.handleInternalPackets(pck)
             return pck
         except socket.timeout:
@@ -1372,6 +1567,138 @@ class RegionClient:
         self.send(msg, reliable=reliable)
         self.last_update_send = time.time()
         
+    def fetch_capabilities(self, cap_names):
+        """Fetches capability URLs from the seed capability."""
+        if not self.seed_cap_url: return
+        
+        try:
+            msg = f"Requesting capabilities {cap_names} from {self.seed_cap_url}..."
+            self.log(msg)
+
+            
+            headers = {
+                'User-Agent': SL_USER_AGENT,
+                'Accept': 'application/llsd+json, application/llsd+xml',
+                'X-SecondLife-Agent-ID': str(self.agent_id),
+                'X-SecondLife-Session-ID': str(self.session_id)
+            }
+            
+            def _do_fetch(payload, content_type):
+                h = headers.copy()
+                if content_type: h['Content-Type'] = content_type
+                req = urllib.request.Request(self.seed_cap_url, data=payload, headers=h)
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as response:
+                        if response.getcode() == 200:
+                            return response.read().decode('utf-8')
+                except Exception as ex:
+#                     print(f"DEBUG: Fetch attempt failed: {ex}")
+                    pass
+                return None
+
+            payload_xml = render_llsd_xml(cap_names).encode('utf-8')
+            resp_data = _do_fetch(payload_xml, 'application/llsd+xml')
+            
+            if resp_data:
+                self.log(f"Raw capability response: {resp_data}")
+#                 print(f"DEBUG: Capability response: {resp_data}") # Fallback
+                
+                if resp_data.strip().startswith('<'):
+                    new_caps = parse_llsd_xml(resp_data)
+                else:
+                    new_caps = json.loads(resp_data)
+
+                # NEW: If any of our requested caps are missing, try a GET on the seed URL.
+                # Many simulators respond to GET with the FULL list of available caps.
+                missing_some = any(c not in new_caps and (not isinstance(new_caps.get('Metadata'), dict) or c not in new_caps['Metadata']) for c in cap_names)
+                
+                if missing_some:
+                    missing_list = [c for c in cap_names if c not in new_caps and (not isinstance(new_caps.get('Metadata'), dict) or c not in new_caps['Metadata'])]
+                    self.log(f"Some caps missing ({missing_list}). Retrying with GET on SeedCap...")
+
+                    resp_data_get = _do_fetch(None, None) # GET request
+                    if resp_data_get:
+                        self.log(f"Raw GET capability response (first 200 chars): {resp_data_get[:200]}...")
+#                         print(f"DEBUG: GET Capability response (first 200 chars): {resp_data_get[:200]}...")
+                        if resp_data_get.strip().startswith('<'):
+                            new_caps_get = parse_llsd_xml(resp_data_get)
+                        else:
+                            new_caps_get = json.loads(resp_data_get)
+                        
+                        if isinstance(new_caps_get, dict):
+                            # Flatten Metadata in GET response as well
+                            if 'Metadata' in new_caps_get and isinstance(new_caps_get['Metadata'], dict):
+                                self.capabilities.update(new_caps_get['Metadata'])
+                            self.capabilities.update(new_caps_get)
+                            new_caps.update(new_caps_get)
+                            self.log(f"Merged GET capabilities. Total now: {len(self.capabilities)}")
+                    else:
+#                         print("DEBUG: GET fallback returned no data.")
+                        pass
+
+                if isinstance(new_caps, dict):
+                    # FIX: Flatten the Metadata map if returned
+                    if 'Metadata' in new_caps and isinstance(new_caps['Metadata'], dict):
+                        self.log("Flattening Metadata map from capability response.")
+                        self.capabilities.update(new_caps['Metadata'])
+                    
+                    self.capabilities.update(new_caps)
+                    self.log(f"Fetched capabilities: {list(new_caps.keys())}")
+                else:
+                    self.log(f"Unexpected capability response format: {type(new_caps)}")
+            else:
+                self.log("Capability fetch failed or returned no data.")
+        except Exception as e:
+            err = f"Error fetching capabilities: {e}"
+            self.log(err)
+#            print(f"ERROR: {err}")
+
+def parse_llsd_xml(xml_str):
+    """
+    Very basic LLSD XML to Python dict/list parser.
+    Supports <map>, <key>, <string>, <array>, <integer>, <boolean>.
+    """
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(xml_str)
+        def _parse_node(node):
+            tag = node.tag
+            if tag == 'map':
+                res = {}
+                key = None
+                for child in node:
+                    if child.tag == 'key':
+                        key = child.text
+                    else:
+                        res[key] = _parse_node(child)
+                return res
+            elif tag == 'array':
+                return [_parse_node(child) for child in node]
+            elif tag == 'string':
+                return node.text or ""
+            elif tag == 'integer':
+                return int(node.text or 0)
+            elif tag == 'boolean':
+                return (node.text or "0") == "1" or (node.text or "").lower() == "true"
+            elif tag == 'llsd':
+                return _parse_node(node[0]) if len(node) > 0 else {}
+            return node.text
+            
+        return _parse_node(root)
+    except Exception as e:
+#         print(f"LLSD XML Parse Error: {e}")
+        return None
+
+def render_llsd_xml(data):
+    """Simple LLSD XML renderer for arrays of strings or maps."""
+    if isinstance(data, list):
+        items = "".join([f"<string>{s}</string>" for s in data])
+        return f"<llsd><array>{items}</array></llsd>"
+    elif isinstance(data, dict):
+        items = "".join([f"<key>{k}</key><string>{v}</string>" for k, v in data.items()])
+        return f"<llsd><map>{items}</map></llsd>"
+    return ""
+
     # RegionClient.teleport_to_region now implemented above
 
 # ==========================================
@@ -1406,6 +1733,10 @@ class SecondLifeAgent:
         self.event_thread = None
         self.current_region_name = ""
         self.current_position = ""
+        
+        # NEW: Display Name Caching
+        self.display_name_cache = {} # UUID -> DisplayName
+        self.fetching_names = set() # Set of UUIDs currently being fetched
         
         # Connection credentials
         self.agent_id = None
@@ -1473,7 +1804,9 @@ class SecondLifeAgent:
                 self.ui_callback("chat_ack", int(seq_id.strip()))
                 
             else:
-                self.debug_callback(message)
+                # Filter out [SPY] messages from reaching the UI/console
+                if not message.startswith("[SPY]"):
+                    self.debug_callback(message)
 
     # ... (rest of class) ...
 
@@ -1506,14 +1839,16 @@ class SecondLifeAgent:
                     if len(map_data) > 2000:
                         self.ui_callback("map_image_fetched", map_data)
                     else:
-                        print(f"Map data too small: {len(map_data)}")
+#                         print(f"Map data too small: {len(map_data)}")
+                        pass
                 else:
-                    print(f"Map HTTP Error: {response.getcode()}")
+#                     print(f"Map HTTP Error: {response.getcode()}")
+                    pass
 
         except Exception as e:
             # Catch ANY crash in the thread
             error_msg = f"{type(e).__name__}: {e}"
-            print(f"MAP THREAD CRASH: {error_msg}")
+#             print(f"MAP THREAD CRASH: {error_msg}")
             self.ui_callback("status", f"⚠️ Map Error: {error_msg}")
             self.ui_callback("map_image_fetched", None)
             
@@ -1626,14 +1961,29 @@ class SecondLifeAgent:
                         # SourceID is the UUID of the sender
                         source_id = chat_data.get('SourceID', None)
 
-                        # 1. Filter empty messages
-                        if not msg_text:
-                            self.log(f"Filtered empty chat message from {from_name}.")
+                        # 1. Filter typing indicators AND Prefetch Display Names
+                        # NOTE: We do this BEFORE filtering empty messages, as typing indicators often have empty bodies.
+                        if chat_type in (const.CHAT_START_TYPING, const.CHAT_STOP_TYPING):
+#                             print(f"DEBUG: Processed Typing Indicator: {chat_type} from {source_id}")
+                            pass
+                            if chat_type == const.CHAT_START_TYPING and source_id:
+                                # Prefetch the display name so it's ready when the message actually arrives
+                                if str(source_id) not in self.display_name_cache:
+#                                     print(f"DEBUG: Triggering Name Prefetch for {source_id}")
+                                    pass
+                                    self.log(f"Prefetching display name for typing user: {source_id}")
+                                    self.get_display_name(source_id, from_name)
+                                else:
+#                                     print(f"DEBUG: Name already cached for {source_id}")
+                                    pass
+                                    
+                            # Filter the message from the UI log
+                            # self.log(f"Filtered typing indicator (Type: {chat_type}) from {from_name}.")
                             continue
 
-                        # 2. Filter typing indicators (39: Start Typing, 40: Stop Typing)
-                        if chat_type in (const.CHAT_START_TYPING, const.CHAT_STOP_TYPING):
-                            self.log(f"Filtered typing indicator (Type: {chat_type}) from {from_name}.")
+                        # 2. Filter empty messages
+                        if not msg_text:
+                            self.log(f"Filtered empty chat message from {from_name}.")
                             continue
                         
                         # 3. Filter own messages (already displayed when ACK'd)
@@ -1641,8 +1991,18 @@ class SecondLifeAgent:
                             self.log(f"Filtered own message echo from simulator.")
                             continue
                             
-                        # Only display valid messages from other avatars
-                        self.ui_callback("chat", f"[{from_name}]: {msg_text}")
+                        # Fetch and use display name
+                        display_name = self.get_display_name(source_id, from_name)
+                        
+                        # FIX: Avoid printing the same name twice AND filter "Resident"
+                        clean_from_name = from_name.replace(" Resident", "")
+                        
+                        if display_name and display_name != from_name:
+                            name_label = f"{display_name} ({clean_from_name})"
+                        else:
+                            name_label = clean_from_name
+                            
+                        self.ui_callback("chat", f"[{name_label}]: {msg_text}")
                 
                 # --- Handle Teleport Offer ---
                 elif packet_name == "TeleportOffer":
@@ -1814,6 +2174,124 @@ class SecondLifeAgent:
         self.log(f"Accepting teleport offer ID {teleport_id}...")
         self.ui_callback("status", "Sending TeleportAccept. Stand by for jump...")
         return self.client.send_teleport_accept(teleport_id, cost, license=True)
+
+    def get_display_name(self, source_id, fallback_name):
+        """Returns the display name if cached, otherwise starts a fetch and returns fallback."""
+        if not source_id: return fallback_name
+        
+        uuid_str = str(source_id)
+        if uuid_str in self.display_name_cache:
+            return self.display_name_cache[uuid_str]
+            
+        if uuid_str not in self.fetching_names:
+            self.fetching_names.add(uuid_str)
+
+            threading.Thread(target=self._fetch_display_names_task, args=([uuid_str],), daemon=True).start()
+            
+        return fallback_name
+
+    def _fetch_display_names_task(self, uuids):
+        """Background task to fetch display names."""
+        if not self.client: return
+        
+        try:
+            # 1. Ensure we have the AvatarsDisplayName capability
+            if "AvatarsDisplayName" not in self.client.capabilities and "GetDisplayNames" not in self.client.capabilities:
+                # Add PeopleAPI and GetDisplayNames as fallbacks
+                self.client.fetch_capabilities(["AvatarsDisplayName", "GetDisplayNames", "EventQueueGet", "PeopleAPI"])
+                
+            cap_url = self.client.capabilities.get("AvatarsDisplayName") or self.client.capabilities.get("GetDisplayNames")
+            if not cap_url:
+                self.log("AvatarsDisplayName capability not available.")
+
+                return
+                
+            # 2. Request display names
+            query_url = f"{cap_url}?ids=" + "&ids=".join(uuids)
+            msg = f"Fetching display names from: {query_url}"
+            self.log(msg)
+            
+            headers = {
+                'User-Agent': SL_USER_AGENT,
+                'Accept': '*/*', # Try to be maximally permissive
+                'X-SecondLife-Agent-ID': str(self.agent_id),
+                'X-SecondLife-Session-ID': str(self.session_id)
+            }
+            
+            req = urllib.request.Request(query_url, headers=headers)
+            
+            try:
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    if response.getcode() == 200:
+                        resp_data = response.read().decode('utf-8')
+                        self.log(f"Raw display name response: {resp_data}")
+
+                        
+                        if resp_data.strip().startswith('<'):
+                            data = parse_llsd_xml(resp_data)
+                        else:
+                            data = json.loads(resp_data)
+                            
+                        # Parse standard Display Name response
+                        if isinstance(data, dict):
+                            if 'agents' in data:
+                                for agent in data['agents']:
+                                    uid = agent.get('id')
+                                    dname = agent.get('display_name')
+                                    if uid and dname:
+                                        self.display_name_cache[uid] = dname
+                                        self.ui_callback("update_display_name", (uid, dname))
+                            elif 'bad_ids' in data and len(data) == 1:
+                                self.log(f"Display name fetch returned bad_ids: {data['bad_ids']}")
+                            else:
+                                self.log(f"Unexpected display name response format: {list(data.keys())}")
+                                # CHECK: If we got back a capability list ( Metadata / EventQueueGet ), Try POST!
+                                if 'Metadata' in data or 'EventQueueGet' in data:
+                                    self.log("GET returned capability list? Retrying with POST...")
+
+                                    
+                                    # Prepare POST payload
+                                    payload = render_llsd_xml({'ids': [str(u) for u in uuids]}).encode('utf-8')
+                                    req_post = urllib.request.Request(query_url.split('?')[0], data=payload, headers={
+                                        'User-Agent': SL_USER_AGENT,
+                                        'Content-Type': 'application/llsd+xml',
+                                        'Accept': 'application/llsd+xml',
+                                        'X-SecondLife-Agent-ID': str(self.agent_id),
+                                        'X-SecondLife-Session-ID': str(self.session_id)
+                                    })
+                                    
+                                    with urllib.request.urlopen(req_post, timeout=10) as response_post:
+                                        if response_post.getcode() == 200:
+                                            resp_data_post = response_post.read().decode('utf-8')
+
+                                            if resp_data_post.strip().startswith('<'):
+                                                data_post = parse_llsd_xml(resp_data_post)
+                                            else:
+                                                data_post = json.loads(resp_data_post)
+                                            
+                                            if isinstance(data_post, dict) and 'agents' in data_post:
+                                                for agent in data_post['agents']:
+                                                    uid = agent.get('id')
+                                                    dname = agent.get('display_name')
+                                                    if uid and dname:
+                                                        self.display_name_cache[uid] = dname
+                                                        self.ui_callback("update_display_name", (uid, dname))
+            except urllib.error.HTTPError as e:
+                self.log(f"HTTP Error fetching display names: {e.code} {e.reason}")
+
+                # Try reading error body
+                try:
+                    err_body = e.read().decode('utf-8')
+                except: pass
+                        
+        except Exception as e:
+            err = f"Error fetching display names: {e}"
+            self.log(err)
+#            print(f"ERROR: {err}")
+        finally:
+            for uid in uuids:
+                if uid in self.fetching_names:
+                    self.fetching_names.remove(uid)
 
     # MODIFIED: Fix implemented here to ensure MapNameRequest is reliable
     def teleport(self, region_name):
@@ -2031,6 +2509,12 @@ class SecondLifeAgent:
             self.log("HTTP Login successful! Token received.")
             self.ui_callback("progress", ("HTTP Login Success", 10))
             
+            # Diagnostic: Log all keys and if 'capabilities' is present
+#             print(f"DEBUG: Login Token Keys: {list(login_token.keys())}")
+            if 'capabilities' in login_token:
+#                 print(f"DEBUG: Capabilities in Login Token: {list(login_token['capabilities'].keys())}")
+                pass
+            
             self.circuit_code = int(login_token['circuit_code'])
             self.agent_id = UUID(login_token['agent_id'])
             self.session_id = UUID(login_token['session_id'])
@@ -2039,8 +2523,9 @@ class SecondLifeAgent:
             self.first_name = first 
 
             self.log("Initializing UDP Stream...")
-            # MODIFIED: Pass self.log directly as the log_callback
-            self.client = RegionClient(login_token, debug=self.debug_callback is not None, log_callback=self.log) 
+            # Always set debug=True in RegionClient so that it sends logs to SecondLifeAgent.log
+            # The agent itself will decide whether to pass them to the UI based on debug_callback.
+            self.client = RegionClient(login_token, debug=True, log_callback=self.log) 
             self.raw_socket = self.get_socket()
             self.log(f"Socket acquisition status: {'Success' if self.raw_socket else 'Failed'}")
 
@@ -2108,7 +2593,7 @@ def save_credentials(credentials):
             
         return True
     except Exception as e:
-        print(f"Error saving credentials: {e}")
+#         print(f"Error saving credentials: {e}")
         return False
 
 def load_credentials():
@@ -2142,7 +2627,7 @@ def load_credentials():
                 
         return decrypted_data
     except Exception as e:
-        print(f"Error loading credentials (file corrupted?): {e}")
+#         print(f"Error loading credentials (file corrupted?): {e}")
         return []
 
 # ==========================================
@@ -2454,20 +2939,20 @@ class MinimapCanvas(tk.Canvas):
             x_on_canvas = agent_x_sl * scale + offset_x
             y_on_canvas = (self.size - agent_y_sl) * scale + offset_y
             
-            # Draw Bullseye Indicator (Red outer, Yellow inner)
-            # Replaces the complex Green Arrow
-            r_outer = 5
-            r_inner = 2
+            # Draw Bullseye Indicator (Bright Cyan outer, White inner)
+            # Sized to be distinct but not overly large
+            r_outer = 4
+            r_inner = 1
             
-            # Outer Red Circle
+            # Outer Bright Cyan Circle
             self.create_oval(x_on_canvas - r_outer, y_on_canvas - r_outer, 
                              x_on_canvas + r_outer, y_on_canvas + r_outer,
-                             fill="#FF0000", outline="#000000")
+                             fill="#00FFFF", outline="#000000", width=2)
             
-            # Inner Yellow Dot
+            # Inner White Dot
             self.create_oval(x_on_canvas - r_inner, y_on_canvas - r_inner,
                              x_on_canvas + r_inner, y_on_canvas + r_inner,
-                             fill="#FFFF00", outline="#000000")
+                             fill="#FFFFFF", outline="#000000")
 
         # Schedule the next redraw
         if self.agent.running:
@@ -2568,7 +3053,8 @@ class ChatTab(ttk.Frame):
         control_frame = ttk.Frame(self, style='BlackGlass.TFrame')
         control_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(10, 5))
         
-        ttk.Label(control_frame, text=f"Agent: {self.my_first_name} {self.my_last_name}", style='BlackGlass.TLabel', font=('Helvetica', 12, 'bold')).pack(side=tk.LEFT, padx=5)
+        self.agent_name_label = ttk.Label(control_frame, text=f"Agent: {self.my_first_name} {self.my_last_name}", style='BlackGlass.TLabel', font=('Helvetica', 12, 'bold'))
+        self.agent_name_label.pack(side=tk.LEFT, padx=5)
         
         teleport_button = ttk.Button(control_frame, text="Teleport...", command=self.do_teleport, style='BlackGlass.TButton')
         teleport_button.pack(side=tk.RIGHT, padx=5)
@@ -2706,8 +3192,19 @@ class ChatTab(ttk.Frame):
         elif message == "MINIMAP_UPDATE":
              # Use self.after to redraw safely from the main thread
              self.after(0, self.minimap.draw_map) 
+             
+        elif message.startswith("[CHAT]"):
+            # Some old scripts might still be sending messages prefix with [CHAT]
+            clean = message.replace("[CHAT]", "").strip()
+            self.after(0, self._append_chat, clean)
+            
+        elif message.startswith("[SPY]"):
+             # Ignore SPY packets in the UI entirely
+             pass
+             
         else:
-             # Pass on to the application's central debug handler
+             # SILENCED: No longer route generic debug messages to the notification area
+             # Still pass on to the application's central debug handler for logging if needed
              self.tab_manager.handle_debug_log(message)
 
 
@@ -2720,7 +3217,19 @@ class ChatTab(ttk.Frame):
             seq_id = message
             if seq_id in self.pending_chat:
                 confirmed_msg = self.pending_chat.pop(seq_id)
-                self.after(0, self._append_chat, f"[{self.my_first_name} {self.my_last_name}]: {confirmed_msg}")
+                # Fetch self display name
+                agent_id = self.sl_agent.client.agent_id if self.sl_agent.client else None
+                from_name = f"{self.my_first_name} {self.my_last_name}"
+                display_name = self.sl_agent.get_display_name(agent_id, from_name)
+                
+                # FIX: Avoid printing the same name twice
+                if display_name and display_name != from_name:
+                    name_label = f"{display_name} ({from_name})"
+                    self.after(0, self.agent_name_label.config, {'text': f"Agent: {name_label}"})
+                else:
+                    name_label = from_name
+                    
+                self.after(0, self._append_chat, f"[{name_label}]: {confirmed_msg}")
         elif update_type == "status":
             # This is primarily used for connection/teleport status updates
             self.after(0, self._update_status, message)
@@ -2744,6 +3253,26 @@ class ChatTab(ttk.Frame):
         elif update_type == "map_image_fetched":
             # Handle image data received from the fetch thread
             self.after(0, lambda: self._handle_map_image_data(message))
+            
+        elif update_type == "update_display_name":
+            # Handle asynchronous display name update
+            uid, dname = message
+            self.after(0, lambda: self.update_display_name(uid, dname))
+
+
+    def update_display_name(self, uid, display_name):
+        """Updates the UI when a display name is resolved."""
+        # 1. Update the top bar label if it's the current agent
+        if self.sl_agent.client and str(self.sl_agent.client.agent_id) == str(uid):
+            full_name = f"{self.my_first_name} {self.my_last_name}"
+            clean_full_name = full_name.replace(" Resident", "")
+            
+            if display_name != full_name:
+                self.agent_name_label.config(text=f"Agent: {display_name} ({clean_full_name})")
+            else:
+                self.agent_name_label.config(text=f"Agent: {clean_full_name}")
+                
+        # 2. (Future) Retroactive chat log updates could be implemented here if messages were tagged.
 
 
     def _append_chat(self, message):
@@ -2782,20 +3311,6 @@ class ChatTab(ttk.Frame):
     # --- NEW METHOD (End) ---
 
     # --- NEW METHOD: Missing log callback ---
-    def handle_debug_log_callback(self, message):
-        """Handles debug messages from the agent."""
-        if message == "MINIMAP_UPDATE":
-            self.minimap.after(0, self.minimap.update_map)
-            return
-            
-        if message.startswith("[CHAT]"):
-            clean = message.replace("[CHAT]", "").strip()
-            self.after(0, self._append_chat, clean)
-            return
-            
-        if message.startswith("DEBUG: "):
-            # Optional: direct to notification
-            pass
             
     def _show_teleport_offer(self, offer_data):
         region_name = offer_data['region']
