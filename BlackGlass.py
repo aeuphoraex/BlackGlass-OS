@@ -763,6 +763,38 @@ class MapItemReply(BaseMessage):
     }
 registerMessage(MapItemReply)
 
+# --- Agent Data Messages ---
+
+class AgentMovementComplete(BaseMessage):
+    name = "AgentMovementComplete"; id = 250; freq = 2; trusted = True; zero_coded = True
+    blocks = [("AgentData", 1), ("Data", 1)]
+    structure = {
+        "AgentData": [("AgentID", "LLUUID"), ("SessionID", "LLUUID")],
+        "Data": [
+            ("Position", "LLVector3"), ("LookAt", "LLVector3"), 
+            ("RegionHandle", "U64"), ("Timestamp", "U32")
+        ]
+    }
+registerMessage(AgentMovementComplete)
+
+class AgentDataRequest(BaseMessage):
+    name = "AgentDataRequest"; id = 225; freq = 2; trusted = False; zero_coded = True
+    blocks = [("AgentData", 1)]
+    structure = {"AgentData": [("AgentID", "LLUUID"), ("SessionID", "LLUUID")]}
+registerMessage(AgentDataRequest)
+
+class AgentDataUpdate(BaseMessage):
+    name = "AgentDataUpdate"; id = 156; freq = 2; trusted = True; zero_coded = True
+    blocks = [("AgentData", 1)]
+    structure = {
+        "AgentData": [
+            ("AgentID", "LLUUID"), ("SessionID", "LLUUID"), 
+            ("FirstName", "Variable", 1), ("LastName", "Variable", 1),
+            ("GroupMask", "U32"), ("AbilityMask", "U32"), ("GodLevel", "U8")
+        ]
+    }
+registerMessage(AgentDataUpdate)
+
 # --- Object/Self Position Update Messages (For Minimap) ---
 
 class ImprovedTerseObjectUpdate(BaseMessage):
@@ -1385,6 +1417,18 @@ class RegionClient:
             self.other_avatars = new_avatars
             self.log_callback("MINIMAP_UPDATE")
 
+        elif pck.body.name == "AgentMovementComplete":
+            pos = pck.body.Data["Position"]
+            self.agent_x = pos.x
+            self.agent_y = pos.y
+            self.agent_z = pos.z
+            # self.log(f"[DEBUG] Location updated via AgentMovementComplete: {pos.x:.1f}, {pos.y:.1f}")
+            self.log_callback("MINIMAP_UPDATE")
+
+        elif pck.body.name == "AgentDataUpdate":
+            # AgentDataUpdate usually doesn't have Position in this freq/id combo, but we handle it safely
+            pass
+
         elif pck.body.name == "StartPingCheck":
             msg = getMessageByName("CompletePingCheck")
             msg.PingID["PingID"] = pck.body.PingID["PingID"]
@@ -1413,6 +1457,9 @@ class RegionClient:
             # This confirms the client's state and location, often resolving a silent sim info deadlock.
             self.agentUpdate(controls=0, reliable=True)
             # --- END RECOMMENDED FIX ---
+            
+            # --- NEW: Request Agent Data for initial location ---
+            self.requestAgentData()
             
             # --- MAP FETCH TRIGGER ---
             # Trigger map fetch whenever a RegionHandshake is successfully processed.
@@ -1562,10 +1609,14 @@ class RegionClient:
         msg.AgentData["Far"] = 1024.0
         msg.AgentData["ControlFlags"] = controls
         msg.AgentData["Flags"] = 0
-        
-        # We send the message object, letting self.send handle sequence and ACKs
         self.send(msg, reliable=reliable)
         self.last_update_send = time.time()
+        
+    def requestAgentData(self):
+        msg = getMessageByName("AgentDataRequest")
+        msg.AgentData["AgentID"] = self.agent_id
+        msg.AgentData["SessionID"] = self.session_id
+        self.send(msg)
         
     def fetch_capabilities(self, cap_names):
         """Fetches capability URLs from the seed capability."""
@@ -2941,7 +2992,7 @@ class MinimapCanvas(tk.Canvas):
             
             # Draw Bullseye Indicator (Bright Cyan outer, White inner)
             # Sized to be distinct but not overly large
-            r_outer = 4
+            r_outer = 3
             r_inner = 1
             
             # Outer Bright Cyan Circle
