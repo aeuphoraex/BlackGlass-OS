@@ -52,24 +52,9 @@ Python: 3.7+
 
 Pillow (PIL): Required for minimap image rendering.
 
-Bash
 pip install Pillow
+
 Standard Libraries: tkinter, socket, threading, xmlrpc, ssl.
-
-⌨️ Controls & Commands
-Movement (While Chat Tab is Focused)
-Arrow Keys: Move Forward/Backward/Left/Right.
-
-E / C: Move Up / Move Down.
-
-Space: Jump.
-
-F: Toggle Fly Mode.
-
-Special Chat Commands
-/hardtp <Region Name>: Instantly logs out and logs back in at the center of the specified region.
-
-/relog <Region Name>: Alias for hard teleport.
 
 🚀 Getting Started
 Clone the repository or download BlackGlass.py.
