@@ -34,6 +34,38 @@ except ImportError:
 # ==========================================
 # SECTION 1: CORE TYPES (llTypes.py)
 # ==========================================
+
+# --- Performance Fix: Limited ScrolledText ---
+class LimitedScrolledText(scrolledtext.ScrolledText):
+    """
+    A ScrolledText widget that limits the number of lines it displays
+    to prevent memory bloat and UI lag over time.
+    """
+    def __init__(self, master=None, max_lines=1000, **kw):
+        super().__init__(master, **kw)
+        self.max_lines = max_lines
+
+    def insert(self, index, chars, *args):
+        super().insert(index, chars, *args)
+        self._prune()
+
+    def _prune(self):
+        """Removes the oldest lines if we exceed max_lines."""
+        # Get the number of lines (returns string like "100.0")
+        try:
+            # "end-1c" because "end" includes the auto-newline at the end
+            num_lines = int(float(self.index("end-1c")))
+            if num_lines > self.max_lines:
+                # Delete from start to the number of excess lines
+                diff = num_lines - self.max_lines
+                # We can delete chunks to be more efficient, but line-by-line 
+                # or block deletion logic:
+                # Delete from 1.0 to (1.0 + diff lines)
+                self.delete("1.0", f"{float(diff + 1)}.0")
+        except Exception:
+            pass
+# ---------------------------------------------
+
 class null:
     def __bytes__(self):
         return b""
@@ -734,10 +766,36 @@ class TeleportLocationRequest(BaseMessage):
     name = "TeleportLocationRequest"; id = 67; freq = 2; trusted = False; zero_coded = True
     blocks = [("AgentData", 1), ("Info", 1)]
     structure = {
-        "AgentData": [("AgentID", "LLUUID"), ("SessionID", "LLUUID"), ("TeleportFlags", "U32")],
+        "AgentData": [("AgentID", "LLUUID"), ("SessionID", "LLUUID")],
         "Info": [("RegionHandle", "U64"), ("Position", "LLVector3"), ("LookAt", "LLVector3")]
     }
 registerMessage(TeleportLocationRequest)
+
+class TeleportStart(BaseMessage):
+    name = "TeleportStart"; id = 59; freq = 2; trusted = True; zero_coded = True
+    blocks = [("Info", 1)]
+    structure = {"Info": [("TeleportFlags", "U32")]}
+registerMessage(TeleportStart)
+
+class TeleportProgress(BaseMessage):
+    name = "TeleportProgress"; id = 60; freq = 2; trusted = True; zero_coded = True
+    blocks = [("Info", 1), ("AgentData", 1)]
+    structure = {
+        "Info": [("TeleportFlags", "U32"), ("Message", "Variable", 1)],
+        "AgentData": [("AgentID", "LLUUID")]
+    }
+registerMessage(TeleportProgress)
+
+class TeleportFailed(BaseMessage):
+    name = "TeleportFailed"; id = 61; freq = 2; trusted = True; zero_coded = True
+    blocks = [("Info", 1), ("AlertInfo", 0)]
+    structure = {
+        "Info": [("Reason", "Variable", 1)],
+        "AlertInfo": [("ExtraParams", "Variable", 1)]
+    }
+registerMessage(TeleportFailed)
+
+registerMessage(TeleportFailed)
 
 # --- Map Lookup Messages ---
 
@@ -1108,30 +1166,24 @@ class RegionClient:
         # Extract initial region grid coordinates (in meters) and convert to tile coordinates
         # Default is Da Boom (1000, 1000) if missing
         
-        # DEBUG: Dump token keys to check for region_x/y existence
-        self.log_callback(f"[CHAT] Login Token Keys: {list(loginToken.keys())}")
-        
         try:
             val_x = loginToken.get("region_x", 0)
             val_y = loginToken.get("region_y", 0)
-            self.log_callback(f"[CHAT] Token Raw X: {val_x} ({type(val_x)}), Y: {val_y} ({type(val_y)})")
             
             r_x = int(float(val_x))
             r_y = int(float(val_y))
         except Exception as e:
-            self.log_callback(f"[CHAT] Coord Parse Error: {e}")
+            self.log(f"Coord Parse Error: {e}")
             r_x = 0; r_y = 0
             
         if r_x > 0 and r_y > 0:
             self.grid_x = r_x // 256
             self.grid_y = r_y // 256
         else:
-            # If coordinates are missing, we default to 1000, 1000 but log a warning
-            self.log_callback("[CHAT] Warning: Region coordinates missing/invalid. Defaulting to (1000, 1000).")
-            self.grid_x = 1000
-            self.grid_y = 1000
-            
-        self.log_callback(f"[CHAT] Using Grid Coords: {self.grid_x}, {self.grid_y}")
+            # If coordinates are missing, we default to 0, 0 to trigger the fallback lookup mechanism
+            self.log_callback("[CHAT] Warning: Region coordinates missing/invalid. Defaulting to (0, 0).")
+            self.grid_x = 0
+            self.grid_y = 0
         
         
         self.last_circuit_send = 0 # Forces an immediate send on first loop iteration
@@ -1194,21 +1246,21 @@ class RegionClient:
 
     # MODIFIED: Logic moved to _teleport_lookup_task, this is just a stub for Agent usage
     def teleport_to_region(self, region_name, region_handle, position):
-        """Sends the final TeleportLocationRequest packet."""
+        """Sends the final TeleportRequest packet."""
         
-        msg = getMessageByName("TeleportLocationRequest")
+        # Try TeleportRequest (ID 66) instead of TeleportLocationRequest (ID 67)
+        msg = getMessageByName("TeleportRequest")
         
         msg.AgentData["AgentID"] = self.agent_id
         msg.AgentData["SessionID"] = self.session_id
-        msg.AgentData["TeleportFlags"] = 0 
 
         msg.Info["RegionHandle"] = region_handle
         msg.Info["Position"] = position
         msg.Info["LookAt"] = vector3(0.0, 1.0, 0.0)
 
-        # IMPORTANT: TeleportLocationRequest should be reliable and acknowledged
+        # IMPORTANT: TeleportRequest should be reliable and acknowledged
         self.send(msg, reliable=True)
-        self.log(f"Sent TeleportLocationRequest to handle {region_handle}")
+        self.log(f"Sent TeleportRequest to handle {region_handle}")
         return True
 
     # MODIFIED: Logic added to trigger MAP_FETCH_TRIGGER on RegionHandshake
@@ -1464,16 +1516,34 @@ class RegionClient:
             # --- MAP FETCH TRIGGER ---
             # Trigger map fetch whenever a RegionHandshake is successfully processed.
             if PIL_AVAILABLE: 
-                self.log_callback("MAP_FETCH_TRIGGER", self.sim['name'])
+                self.ui_callback("status", f"Handshake complete. Fetching map for {self.sim['name']}...")
+                self.fetch_map(self.sim['name'])
+            else:
+                 self.ui_callback("status", f"Handshake complete. Map unavailable (PIL missing).")
             # --- END MAP FETCH TRIGGER ---
             
             # --- FIX: Send the successful login status to the UI ---
-            self.log_callback("HANDSHAKE_COMPLETE", self.sim['name'])
+            self.log_callback(f"HANDSHAKE_COMPLETE, {self.sim['name']}")
+
+        elif pck.body.name == "TeleportStart":
+            self.ui_callback("status", "🚀 Teleport sequence started...")
+            self.log("TeleportStart received.")
+
+        elif pck.body.name == "TeleportProgress":
+            msg = getattr(pck.body.Info, 'Message', b'').decode('utf-8', errors='ignore').strip()
+            self.ui_callback("status", f"⏳ Teleport progress: {msg}")
+            self.log(f"TeleportProgress: {msg}")
+
+        elif pck.body.name == "TeleportFailed":
+            reason = getattr(pck.body.Info, 'Reason', b'').decode('utf-8', errors='ignore').strip()
+            self.ui_callback("status", f"❌ Teleport Failed: {reason}")
+            self.log(f"TeleportFailed: {reason}")
             # --- END FIX ---
             
         # --- KICKUSER HANDLING (NEW) ---
+        elif pck.body.name == "KickUser":
             reason = safe_decode_llvariable(pck.body.TargetBlock.get('Reason', 'Unknown reason from sim.'))
-            self.log_callback("KICKED", reason)
+            self.log_callback(f"KICKED, {reason}")
         # --- END KICKUSER HANDLING ---
 
         elif pck.body.name == "TeleportFinish":
@@ -1840,14 +1910,19 @@ class SecondLifeAgent:
                 self.ui_callback("status", f"🟢 Successfully logged in to {region_name.strip()}!")
                 self.ui_callback("progress", ("RegionHandshake Received", 100))
                 
-                # REMOVED: Triggering map fetch here is race-prone. 
-                # It is now handled in ChatTab.__init__ to ensure UI readiness.
+                # FIX: Forward to debug_callback so ChatTab can trigger map fetch
+                if self.debug_callback:
+                    self.debug_callback(message)
                     
             # --- KICKED LOG HANDLER (NEW) ---
             elif message.startswith("KICKED"):
                 _, reason = message.split(", ", 1)
                 self.ui_callback("status", f"🔴 Kicked: {reason.strip()}")
                 self.running = False # Stop the event loop upon kick
+                
+                # FIX: Forward to debug_callback so ChatTab can handle disconnect UI
+                if self.debug_callback:
+                    self.debug_callback(message)
                 
             # --- CHAT ACK HANDLER ---
             elif message.startswith("ACK_CONFIRMED:"):
@@ -1971,6 +2046,20 @@ class SecondLifeAgent:
                         self.client.reliable_packets[seq_id] = (pck, current_time) 
             # --- End Resend Reliable Packets ---
 
+            # --- Performance Fix: Prune Reliable Packets ---
+            # Remove packets older than 60 seconds to prevent memory leaks/unbounded growth
+            # if the server stops ACking them.
+            if len(self.client.reliable_packets) > 0:
+                 # Check periodically (every 5 seconds roughly, based on iteration count or just random)
+                 if random.random() < 0.05: 
+                     cutoff = current_time - 60.0
+                     # Find expired keys
+                     expired = [sid for sid, (_, ts) in self.client.reliable_packets.items() if ts < cutoff]
+                     for sid in expired:
+                         del self.client.reliable_packets[sid]
+                         self.log(f"Pruned stale reliable packet {sid} (Older than 60s)")
+            # -----------------------------------------------
+
 
             # --- Packet Receiving ---
             packet = self.client.recv()
@@ -1991,6 +2080,7 @@ class SecondLifeAgent:
                     self.current_position = "Landed"
                     
                     # The success message is now handled inside self.log via the HANDSHAKE_COMPLETE trigger
+                    self.log(f"HANDSHAKE_COMPLETE, {self.current_region_name}") # FIX: Trigger the UI update
                     
                     time.sleep(0.1) 
                     # FIX: Send reliable CAM, it's already set to reliable=True in RegionClient.send_complete_movement()
@@ -2234,6 +2324,18 @@ class SecondLifeAgent:
         if uuid_str in self.display_name_cache:
             return self.display_name_cache[uuid_str]
             
+
+            
+        # --- Performance Fix: Limit Cache Size ---
+        if len(self.display_name_cache) > 2000:
+            # Clear half the cache if it gets too big (simplest LRU approximation without using OrderedDict)
+            # Python 3.7+ dicts preserve insertion order, so this removes the oldest 1000 items.
+            self.log("Pruning display name cache...")
+            keys_to_remove = list(self.display_name_cache.keys())[:1000]
+            for k in keys_to_remove:
+                del self.display_name_cache[k]
+        # -----------------------------------------
+
         if uuid_str not in self.fetching_names:
             self.fetching_names.add(uuid_str)
 
@@ -2358,8 +2460,8 @@ class SecondLifeAgent:
         # Use simple unquoted version for the tile name part
         region_name_url = urllib.parse.quote(region_name.strip().replace(' ', '_')) 
         
-        # *** NEW: Add a small delay for map server processing ***
-        time.sleep(2.0)
+        # *** NEW: Removed small delay for map server processing to speed up load ***
+        # time.sleep(2.0)
         
         # 2. Define multiple URLs with fallback logic
         # *** FIX: Using robust coordinate-based URLs as primary ***
@@ -2367,6 +2469,22 @@ class SecondLifeAgent:
         # Current grid coordinates
         gx = self.client.grid_x
         gy = self.client.grid_y
+        
+        # FIX: If coords are missing (fresh login), try to resolve them via gridsurvey
+        if gx == 0 and gy == 0:
+             self.ui_callback("status", f"📍 Resolving coordinates for {region_name}...")
+             self.log(f"Map fetch: Coords are 0,0. Attempting gridsurvey lookup for '{region_name}'...")
+             
+             info = self._gridsurvey_region_lookup(region_name)
+             if info:
+                 gx = int(info['X'])
+                 gy = int(info['Y'])
+                 # Update client state for future use
+                 self.client.grid_x = gx
+                 self.client.grid_y = gy
+                 self.log(f"Map fetch: Resolved coords to {gx}, {gy}")
+             else:
+                 self.log(f"Map fetch: Gridsurvey lookup failed. Will attempt fallback URLs.")
         
         urls_to_try = [
             # Primary: Standard coordinate-based format (Zoom level 1) - FORCE HTTPS
@@ -2401,6 +2519,7 @@ class SecondLifeAgent:
                         # A valid map image should be significantly larger than a few bytes
                         # Error images or small placeholders are often < 2KB
                         if len(map_data) > 2000: 
+                            self.ui_callback("status", f"Map loaded for {region_name}.")
                             self.ui_callback("map_image_fetched", map_data)
                             return # Success!
                         else:
@@ -2435,10 +2554,126 @@ class SecondLifeAgent:
             return
             
         threading.Thread(target=self._fetch_map_image_task, args=(region_name,), daemon=True).start()
+    
+    # NEW: GridSurvey API-based region lookup (doesn't require handshake)
+    def _gridsurvey_region_lookup(self, region_name=None, grid_x=None, grid_y=None):
+        """Look up region handle using the gridsurvey.com API.
+        
+        Can look up by name OR by grid coordinates (x, y).
+        
+        Args:
+            region_name: Name of the region to look up (optional)
+            grid_x: Grid X coordinate (optional)
+            grid_y: Grid Y coordinate (optional)
+            
+        Returns:
+            dict with 'Handle', 'X', 'Y', 'Name' keys, or None if lookup failed
+        """
+        if region_name:
+            encoded_name = urllib.parse.quote(region_name.strip())
+            url = f"http://api.gridsurvey.com/simquery.php?region={encoded_name}"
+        elif grid_x is not None and grid_y is not None:
+            # FIX: Correct parameter is 'xy' and we request just the name
+            url = f"http://api.gridsurvey.com/simquery.php?xy={grid_x},{grid_y}&item=name"
+        else:
+            self.log("[GridSurvey] Error: Must provide either region_name or grid coordinates.")
+            return None
+        
+        try:
+            self.log(f"[GridSurvey] Looking up '{region_name}' at {url}")
+            headers = {
+                'User-Agent': 'BlackGlass SL Client/1.0 (gridsurvey lookup)'
+            }
+            request = urllib.request.Request(url, headers=headers)
+            
+            with urllib.request.urlopen(request, timeout=7) as response:
+                if response.getcode() == 200:
+                    data = response.read().decode('utf-8')
+                    self.log(f"[GridSurvey] Response received: {len(data)} bytes")
+                    
+                    # --- Special handling for coordinate lookup (item=name) ---
+                    if grid_x is not None and 'item=name' in url:
+                        name_result = data.strip()
+                        if "Error" not in name_result:
+                            self.log(f"[GridSurvey] Found region name by coords: {name_result}")
+                            # We construct a synthetic result since we already know X/Y
+                            # Calculate handle
+                            x_meters = int(grid_x) * 256
+                            y_meters = int(grid_y) * 256
+                            handle = (y_meters << 32) | x_meters
+                            return {
+                                'Handle': handle,
+                                'X': int(grid_x),
+                                'Y': int(grid_y),
+                                'Name': name_result
+                            }
+                        else:
+                            self.log(f"[GridSurvey] API Error: {name_result}")
+                            return None
+                    # -----------------------------------------------------------
+
+                    # Parse key-value pairs (format: "key value\n" - space-separated) for standard region lookup
+                    result = {}
+                    for line in data.strip().split('\n'):
+                        # Support both space-separated and equals-separated formats
+                        if '=' in line:
+                            key, value = line.split('=', 1)
+                            result[key.strip()] = value.strip()
+                        elif ' ' in line and not line.startswith('Error'):
+                            parts = line.split(' ', 1)
+                            if len(parts) == 2:
+                                result[parts[0].strip()] = parts[1].strip()
+                    
+                    # Check if region was found - gridsurvey returns x/y coordinates, not simhandle
+                    if 'x' in result and 'y' in result:
+                        try:
+                            grid_x = int(result['x'])
+                            grid_y = int(result['y'])
+                            
+                            # Check if region has valid coordinates (not 0,0 which means not found)
+                            if grid_x == 0 and grid_y == 0:
+                                self.log(f"[GridSurvey] Region '{region_name}' not found (coords=0,0)")
+                                return None
+                            
+                            # Calculate region handle from grid coordinates
+                            # Handle format: (y_meters << 32) | x_meters
+                            # Grid coordinates are in 256m tiles, so multiply by 256 to get meters
+                            x_meters = grid_x * 256
+                            y_meters = grid_y * 256
+                            handle = (y_meters << 32) | x_meters
+                            
+                            self.log(f"[GridSurvey] Found region: grid=({grid_x}, {grid_y}), handle={handle}")
+                            
+                            return {
+                                'Handle': handle,
+                                'X': grid_x,
+                                'Y': grid_y,
+                                'Name': result.get('name', region_name)
+                            }
+                        except (ValueError, KeyError) as e:
+                            self.log(f"[GridSurvey] Invalid coordinate format: x={result.get('x')}, y={result.get('y')} - {e}")
+                            return None
+                    else:
+                        self.log(f"[GridSurvey] No 'x' or 'y' fields in response. Keys: {list(result.keys())}")
+                        return None
+                else:
+                    self.log(f"[GridSurvey] HTTP {response.getcode()} from API")
+                    return None
+                    
+        except urllib.error.HTTPError as e:
+            self.log(f"[GridSurvey] HTTP Error {e.code}: {e.reason}")
+            return None
+        except Exception as e:
+            self.log(f"[GridSurvey] Lookup error: {type(e).__name__}: {e}")
+            return None
             
     # NEW: Worker thread target for teleport lookup/request
     def _teleport_lookup_task(self, region_name):
-        """Handles the blocking map lookup and subsequent teleport request with retries."""
+        """Handles the blocking map lookup and subsequent teleport request with retries.
+        
+        Uses gridsurvey API as a fallback when RegionHandshake is incomplete or
+        MapNameRequest fails.
+        """
         
         # NOTE: Teleporting to 'home' or 'last' is handled by the initial login server call
         # which is outside of this in-world mechanism.
@@ -2447,69 +2682,101 @@ class SecondLifeAgent:
             self.ui_callback("status", f"❌ Teleport failed: '{region_name}' requires relogging/login-server call.")
             return
 
-        # --- Region Lookup with Retry Logic ---
+        # --- Decision Point: Choose lookup method based on handshake status ---
         
-        target_name_lower = region_name.lower()
+        result_block = None
         
-        # 1. Initialize state
-        with self.client.teleport_lookup_lock:
-            self.client.teleport_lookup_target_name = target_name_lower
-            self.client.teleport_lookup_result = None
-            self.client.teleport_lookup_event.clear() # Ensure the event is clear
+        # STRATEGY 1: If handshake is NOT complete, use gridsurvey API directly
+        if not self.client.handshake_complete:
+            self.log(f"RegionHandshake incomplete. Using gridsurvey API for '{region_name}'...")
+            self.ui_callback("status", f"🔍 Looking up {region_name} via gridsurvey (handshake incomplete)...")
+            result_block = self._gridsurvey_region_lookup(region_name)
             
-        max_attempts = 3
-        wait_per_attempt = 3.0 # Increase wait time for network latency
-
-        for attempt in range(max_attempts):
-            
-            # Send MapNameRequest
-            self.log(f"Sending MapNameRequest (Attempt {attempt+1}/{max_attempts}) for '{region_name}'...")
-            
-            msg_request = getMessageByName("MapNameRequest")
-            msg_request.AgentData["AgentID"] = self.agent_id
-            msg_request.AgentData["SessionID"] = self.session_id
-            
-            # FIX: The 'variable' class handles null-termination automatically from the string
-            
-            if len(region_name) + 1 > 255: 
-                 self.log(f"Region name '{region_name}' is too long.")
-                 self.ui_callback("status", f"❌ Teleport failed: Region name too long.")
-                 return
-                 
-            # FIX: Ensure the Variable field is set with the correctly encoded bytes and type 1
-            # Pass the raw string, the variable class handles encoding.
-            # Standard region names in map lookup are null-terminated.
-            msg_request.RequestData["Name"] = variable(1, region_name, add_null=True) 
-            msg_request.RequestData["Flags"] = 0 
-            
-            # Send the request
-            # *** FIX: MapNameRequest MUST be sent as a reliable packet ***
-            self.client.send(msg_request, reliable=True)
-            
-            # 2. Wait for MapItemReply (blocking the worker thread)
-            if self.client.teleport_lookup_event.wait(wait_per_attempt):
-                # Event was set, reply was received by the network thread
-                self.log(f"Region lookup received reply on attempt {attempt+1}.")
-                break
+            if result_block:
+                self.log(f"GridSurvey lookup succeeded for '{region_name}'")
             else:
-                self.log(f"Region lookup timed out on attempt {attempt+1}. Retrying...")
-                # Loop continues for next attempt
-
-        # --- Process Final Result ---
+                self.log(f"GridSurvey lookup failed for '{region_name}'")
+                self.ui_callback("status", f"❌ Teleport failed: Region '{region_name}' not found via gridsurvey.")
+                return
         
-        # Extract result block safely
-        with self.client.teleport_lookup_lock:
-            result_block = self.client.teleport_lookup_result
-            self.client.teleport_lookup_target_name = None # Clear state
-            self.client.teleport_lookup_result = None 
-            self.client.teleport_lookup_event.clear() # Clear event one final time
+        # STRATEGY 2: If handshake IS complete, try MapNameRequest first, then fallback to gridsurvey
+        else:
+            self.log(f"RegionHandshake complete. Trying MapNameRequest for '{region_name}'...")
+            self.ui_callback("status", f"🔍 Looking up {region_name}...")
+            
+            # --- Region Lookup with Retry Logic (MapNameRequest) ---
+            
+            target_name_lower = region_name.lower()
+            
+            # 1. Initialize state
+            with self.client.teleport_lookup_lock:
+                self.client.teleport_lookup_target_name = target_name_lower
+                self.client.teleport_lookup_result = None
+                self.client.teleport_lookup_event.clear() # Ensure the event is clear
+                
+            max_attempts = 3
+            wait_per_attempt = 3.0 # Increase wait time for network latency
 
-        if result_block is None:
-            self.log(f"Region lookup for '{region_name}' failed after {max_attempts} attempts.")
-            self.ui_callback("status", f"❌ Teleport failed: Region '{region_name}' not found or timed out.")
-            return
+            for attempt in range(max_attempts):
+                
+                # Send MapNameRequest
+                self.log(f"Sending MapNameRequest (Attempt {attempt+1}/{max_attempts}) for '{region_name}'...")
+                
+                msg_request = getMessageByName("MapNameRequest")
+                msg_request.AgentData["AgentID"] = self.agent_id
+                msg_request.AgentData["SessionID"] = self.session_id
+                
+                # FIX: The 'variable' class handles null-termination automatically from the string
+                
+                if len(region_name) + 1 > 255: 
+                     self.log(f"Region name '{region_name}' is too long.")
+                     self.ui_callback("status", f"❌ Teleport failed: Region name too long.")
+                     return
+                     
+                # FIX: Ensure the Variable field is set with the correctly encoded bytes and type 1
+                # Pass the raw string, the variable class handles encoding.
+                # Standard region names in map lookup are null-terminated.
+                msg_request.RequestData["Name"] = variable(1, region_name, add_null=True) 
+                msg_request.RequestData["Flags"] = 0 
+                
+                # Send the request
+                # *** FIX: MapNameRequest MUST be sent as a reliable packet ***
+                self.client.send(msg_request, reliable=True)
+                
+                # 2. Wait for MapItemReply (blocking the worker thread)
+                if self.client.teleport_lookup_event.wait(wait_per_attempt):
+                    # Event was set, reply was received by the network thread
+                    self.log(f"Region lookup received reply on attempt {attempt+1}.")
+                    break
+                else:
+                    self.log(f"Region lookup timed out on attempt {attempt+1}. Retrying...")
+                    # Loop continues for next attempt
 
-        # 3. Process result and send TeleportLocationRequest
+            # --- Process MapNameRequest Result ---
+            
+            # Extract result block safely
+            with self.client.teleport_lookup_lock:
+                result_block = self.client.teleport_lookup_result
+                self.client.teleport_lookup_target_name = None # Clear state
+                self.client.teleport_lookup_result = None 
+                self.client.teleport_lookup_event.clear() # Clear event one final time
+
+            # If MapNameRequest failed, try gridsurvey as fallback
+            if result_block is None:
+                self.log(f"MapNameRequest failed after {max_attempts} attempts. Trying gridsurvey API...")
+                self.ui_callback("status", f"🔄 Retrying lookup via gridsurvey...")
+                result_block = self._gridsurvey_region_lookup(region_name)
+                
+                if result_block:
+                    self.log(f"GridSurvey fallback succeeded for '{region_name}'")
+                else:
+                    self.log(f"GridSurvey fallback also failed for '{region_name}'")
+                    self.ui_callback("status", f"❌ Teleport failed: Region '{region_name}' not found (tried both methods).")
+                    return
+
+        # --- Send Teleport Request (Common Path) ---
+        
+        # At this point, result_block should contain valid region data
         region_handle = result_block["Handle"]
         
         # Update our client's expected destination coordinates immediately
@@ -2525,7 +2792,43 @@ class SecondLifeAgent:
         position = vector3(128.0, 128.0, 30.0) 
 
         self.client.teleport_to_region(region_name, region_handle, position)
-        self.ui_callback("status", f"Request sent for {region_name}. Waiting for confirmation...")
+        self.ui_callback("status", f"🚀 Teleport request sent for {region_name}. Waiting for confirmation...")
+
+    def hard_teleport(self, region_name, x=128, y=128, z=30):
+        """
+        Performs a 'hard teleport' by logging out and immediately logging back in 
+        at the target region and coordinates.
+        """
+        self.log(f"Initiating Hard Teleport to '{region_name}' at <{x}, {y}, {z}>...")
+        self.ui_callback("status", f"🔄 Relogging to {region_name} ({x}, {y})...")
+        
+        # 1. Format the start URI
+        # Format: uri:Region%20Name&x&y&z
+        encoded_region_name = urllib.parse.quote(region_name.strip())
+        start_uri = f"uri:{encoded_region_name}&{int(x)}&{int(y)}&{int(z)}"
+        
+        # --- FIX: Clear the minimap only if changing regions ---
+        # If we are just relogging in the same region, keep the map for context.
+        if self.current_region_name and region_name.lower().strip() != self.current_region_name.lower().strip():
+             self.ui_callback("clear_map", None)
+        # ------------------------------------------
+        
+        # 2. Stop the current connection
+        self.stop()
+        
+        # 3. Wait a moment for socket cleanup
+        time.sleep(2.0)
+        
+        # 4. Start a new login sequence in a new thread to avoid blocking the UI
+        # We need to call login() again. Since we stored credentials, we can reuse them.
+        
+        def relog_task():
+            try:
+                self.login(self.first_name, self.last_name, self.password, start_uri)
+            except Exception as e:
+                self.ui_callback("status", f"❌ Hard Teleport Failed: {e}")
+                
+        threading.Thread(target=relog_task, daemon=True).start()
 
 
             
@@ -2572,6 +2875,8 @@ class SecondLifeAgent:
             self.sim_ip = login_token.get('sim_ip')
             self.sim_port = int(login_token.get('sim_port'))
             self.first_name = first 
+            self.last_name = last
+            self.password = password 
 
             self.log("Initializing UDP Stream...")
             # Always set debug=True in RegionClient so that it sends logs to SecondLifeAgent.log
@@ -2586,7 +2891,46 @@ class SecondLifeAgent:
             self.event_thread.start()
             
             # --- FIX: Set the initial status to reflect the UDP handshake phase ---
-            self.ui_callback("status", "Handshake started. Waiting for region info...")
+            self.ui_callback("status", "Teleport complete.")
+            
+            # --- NEW: Optimistic Map Fetch ---
+            # If we know the region name from the start URI, fetch the map immediately
+            if region_name.startswith("uri:"):
+                try:
+                    # Format: uri:Region%20Name&128&128&30
+                    parts = region_name[4:].split('&')
+                    encoded_name = parts[0]
+                    decoded_name = urllib.parse.unquote(encoded_name)
+                    self.current_region_name = decoded_name # FIX: Store resolved name
+                    self.fetch_map(decoded_name)
+                except:
+                    pass
+            # --- END NEW ---
+            
+            # --- FALLBACK: Resolve region name from coordinates if not found in URI ---
+            if not self.current_region_name:
+                 # We should have coordinates from the login token (via RegionClient)
+                 gx = self.client.grid_x
+                 gy = self.client.grid_y
+                 
+                 if gx and gy:
+                     self.ui_callback("status", f"📍 Resolving region name for coordinates {gx}, {gy}...")
+                     self.log(f"Login: Region name unknown. Attempting lookup for {gx}, {gy}...")
+                     
+                     # Perform blocking lookup (since we are in a thread)
+                     info = self._gridsurvey_region_lookup(grid_x=gx, grid_y=gy)
+                     
+                     if info and 'Name' in info:
+                         self.current_region_name = info['Name']
+                         self.log(f"Resolved region name: '{self.current_region_name}'")
+                         self.ui_callback("status", f"✅ Resolved region: {self.current_region_name}")
+                         
+                         # Also fetch map
+                         self.fetch_map(self.current_region_name)
+                     else:
+                         self.log("Region name lookup failed.")
+                         self.ui_callback("status", "⚠️ Could not resolve region name.")
+            # -------------------------------------------------------------------------
             # --- END FIX ---
             
             return True
@@ -2866,7 +3210,87 @@ class MinimapCanvas(tk.Canvas):
         self.placeholder_image = self._create_placeholder_image() if PIL_AVAILABLE else None
         self.bind("<Configure>", self.on_resize)
         self.last_update_time = 0
+        self.bind("<Double-Button-1>", self.on_double_click)
         self.after(100, self.draw_map) # Start the drawing loop
+
+    def on_double_click(self, event):
+        """Handles double-click to teleport within the region."""
+        if not self.agent or not self.agent.client or not self.agent.running:
+            return
+
+        # Get canvas dimensions
+        width = self.winfo_width()
+        height = self.winfo_height()
+        dest_size = min(width, height)
+        
+        # Calculate offsets
+        offset_x = (width - dest_size) / 2
+        offset_y = (height - dest_size) / 2
+        
+        # Get click position relative to the map area
+        click_x_rel = event.x - offset_x
+        click_y_rel = event.y - offset_y
+        
+        # Check if click is within the map area
+        if click_x_rel < 0 or click_x_rel > dest_size or click_y_rel < 0 or click_y_rel > dest_size:
+            return
+            
+        # Convert to SIM coordinates (0-256)
+        # scale = dest_size / 256.0
+        # sim_x = click_x_rel / scale
+        # sim_y = (dest_size - click_y_rel) / scale (Y is inverted)
+        
+        scale = dest_size / 256.0
+        sim_x = click_x_rel / scale
+        sim_y = (dest_size - click_y_rel) / scale # Inverted Y for SL
+        
+        # Clamp coordinates to 0-255.9
+        sim_x = max(0.0, min(255.9, sim_x))
+        sim_y = max(0.0, min(255.9, sim_y))
+        
+        # Keep current altitude (Z)
+        current_z = getattr(self.agent.client, 'agent_z', 30.0)
+        
+        # Calculate RegionHandle
+        # Handle = (grid_y * 256) << 32 | (grid_x * 256)
+        gx = getattr(self.agent.client, 'grid_x', 0)
+        gy = getattr(self.agent.client, 'grid_y', 0)
+        
+        if gx == 0 and gy == 0:
+             self.agent.ui_callback("status", "❌ Cannot teleport: Unknown region coordinates.")
+             return
+
+        region_handle = (gy * 256) << 32 | (gx * 256)
+        
+        self.agent.log(f"DEBUG: LocalTeleport - Grid: {gx},{gy} Sim: {sim_x:.1f},{sim_y:.1f} Handle: {region_handle} (0x{region_handle:X})")
+        
+        # Create target position vector
+        target_pos = vector3(sim_x, sim_y, current_z)
+        
+        
+        region_name = self.agent.current_region_name
+        if not region_name and self.agent.client:
+             # Fallback to RegionClient's captured sim name (raw)
+             # We might need to clean it if it wasn't decoded safely
+             raw_name = self.agent.client.sim.get('name', '')
+             if raw_name:
+                 # It might be a variable object str() representation or a raw string
+                 # Attempt to clean it if it looks like variable(...)
+                 region_name = raw_name
+                 if "variable(" in str(region_name):
+                     # If we can't easily parse it, we might be stuck, but usually RegionClient uses str()
+                     # If RegionClient used str(variable), it might be messy. 
+                     # Let's hope RegionHandshake handler in SecondLifeAgent fired.
+                     pass
+                 else:
+                     # Strip nulls
+                     region_name = region_name.replace('\x00', '')
+
+        if region_name and region_name.lower() != "home":
+             self.agent.ui_callback("status", f"🏃 Hard Teleport (Relog) to {sim_x:.0f}, {sim_y:.0f}...")
+             self.agent.hard_teleport(region_name, sim_x, sim_y, current_z)
+        else:
+             self.agent.ui_callback("status", "❌ Cannot teleport: Unknown region name.")
 
     def set_map_image(self, pil_image):
         """Sets the source PIL image for the map."""
@@ -3124,7 +3548,7 @@ class ChatTab(ttk.Frame):
         main_content_frame.grid_rowconfigure(0, weight=1)
 
         # 1. Chat Display (Column 0, Row 0 - Expanding)
-        self.chat_display = scrolledtext.ScrolledText(main_content_frame, state='disabled', wrap=tk.WORD, height=15, 
+        self.chat_display = LimitedScrolledText(main_content_frame, max_lines=500, state='disabled', wrap=tk.WORD, height=15, 
                                                      bg='#1C1C1C', fg='#E0E0E0', font=('Courier', 10), 
                                                      insertbackground='white', 
                                                      relief=tk.FLAT, highlightthickness=1, highlightbackground='#444444')
@@ -3140,7 +3564,7 @@ class ChatTab(ttk.Frame):
         right_panel_frame.grid_rowconfigure(1, weight=0) # Minimap (FIXED HEIGHT, ALIGNED BOTTOM)
 
         # 2a. Event Notifications Area (Row 0 - Takes up remaining vertical space)
-        self.notification_area = scrolledtext.ScrolledText(right_panel_frame, state='disabled', wrap=tk.WORD, height=5, 
+        self.notification_area = LimitedScrolledText(right_panel_frame, max_lines=200, state='disabled', wrap=tk.WORD, height=5, 
                                                      bg='#1C1C1C', fg='#FFFF00', font=('Courier', 9), 
                                                      width=20, # <--- FIX: Explicitly set a small width
                                                      relief=tk.FLAT, highlightthickness=1, highlightbackground='#444444')
@@ -3208,7 +3632,8 @@ class ChatTab(ttk.Frame):
             # which handles resizing effectively.
             
             self.minimap.set_map_image(image)
-            self._append_notification("[SUCCESS] Map tile loaded and displayed.")
+            # self._append_notification("[SUCCESS] Map tile loaded and displayed.")
+
             
         except ImportError:
             # Should not happen if Pillow is installed
@@ -3225,12 +3650,15 @@ class ChatTab(ttk.Frame):
         # --- FIX: Add HANDSHAKE_COMPLETE to the log handler ---
         if message.startswith("HANDSHAKE_COMPLETE"):
             _, region_name = message.split(", ", 1)
-            self.after(0, self._update_status, f"🟢 Successfully logged in to {region_name.strip()}!")
-            self.after(0, self._append_notification, f"[INFO] Logged in to {region_name.strip()}.")
+            region_name = region_name.strip()
+            self.after(0, self._update_status, f"🟢 Successfully logged in to {region_name}!")
+            self.after(0, self._append_notification, f"[INFO] Logged in to {region_name}. Requesting map...")
             
-            # --- FIX: Trigger Map Fetch with Delay ---
-            # Wait 2 seconds to ensure coordinates are stable and UI is ready
-            self.after(2000, lambda: self.sl_agent.fetch_map(region_name.strip()))
+            # --- FIX: Trigger Map Fetch via UI method (clears old map first) ---
+            # Wait 2 seconds to ensure coordinates are stable
+            # Use _start_map_fetch_task to ensure we clear the old map visually first
+            # REMOVED: Redundant map fetch. Now handled directly in RegionHandshake handler.
+            # self.after(2000, lambda: self._start_map_fetch_task(region_name))
             
         # --- KICKED LOG HANDLER (NEW) ---
         elif message.startswith("KICKED"):
@@ -3309,6 +3737,10 @@ class ChatTab(ttk.Frame):
             # Handle asynchronous display name update
             uid, dname = message
             self.after(0, lambda: self.update_display_name(uid, dname))
+            
+        elif update_type == "clear_map":
+            # Clear the minimap image (e.g. on logout/teleport start)
+            self.after(0, lambda: self.minimap.update_map_image(None))
 
 
     def update_display_name(self, uid, display_name):
@@ -3392,6 +3824,20 @@ class ChatTab(ttk.Frame):
         message = self.message_entry.get().strip()
         if not message:
             return
+            
+        # --- COMMAND INTERCEPTION ---
+        if message.lower().startswith("/hardtp ") or message.lower().startswith("/relog "):
+            parts = message.split(' ', 1)
+            if len(parts) > 1:
+                region_name = parts[1].strip()
+                self.sl_agent.hard_teleport(region_name)
+                self.message_entry.delete(0, tk.END)
+                return
+            else:
+                self._append_notification("[USAGE] /hardtp <region_name> or /relog <region_name>")
+                self.message_entry.delete(0, tk.END)
+                return
+        # ----------------------------
         
         # sequence is returned from send_chat
         seq_id = self.sl_agent.send_chat(message)
@@ -3407,7 +3853,8 @@ class ChatTab(ttk.Frame):
         region_name = ThemedAskString.askstring(self.master, "Teleport", "Enter the name of the region to teleport to:")
         
         if region_name:
-            self.sl_agent.teleport(region_name.strip())
+            # FIX: User requested Hard Teleport as the default for the button
+            self.sl_agent.hard_teleport(region_name.strip())
 
     def on_closing(self):
         """Handles the user-initiated logout."""
