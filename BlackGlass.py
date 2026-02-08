@@ -2143,7 +2143,7 @@ class SecondLifeAgent:
                         else:
                             name_label = clean_from_name
                             
-                        self.ui_callback("chat", f"[{name_label}]: {msg_text}")
+                        self.ui_callback("chat", (name_label, msg_text))
                 
                 # --- Handle Teleport Offer ---
                 elif packet_name == "TeleportOffer":
@@ -3199,6 +3199,9 @@ class ThemedAskString(ThemedDialog):
 class MinimapCanvas(tk.Canvas):
     def __init__(self, master, agent, **kwargs):
         # We remove explicit width/height here, as the wrapper manages the size.
+        # FIX: We restore explicit width=256, height=256 to prevent default Canvas sizing from expanding the column.
+        kwargs.setdefault('width', 256)
+        kwargs.setdefault('height', 256)
         super().__init__(master, **kwargs)
         self.agent = agent
         self.configure(bg='#1C1C1C', highlightthickness=1, highlightbackground='#444444')
@@ -3211,7 +3214,7 @@ class MinimapCanvas(tk.Canvas):
         self.bind("<Configure>", self.on_resize)
         self.last_update_time = 0
         self.bind("<Double-Button-1>", self.on_double_click)
-        self.after(100, self.draw_map) # Start the drawing loop
+        self.after(1000, self.draw_map) # Start the drawing loop (1 FPS)
 
     def on_double_click(self, event):
         """Handles double-click to teleport within the region."""
@@ -3431,7 +3434,7 @@ class MinimapCanvas(tk.Canvas):
 
         # Schedule the next redraw
         if self.agent.running:
-            self.after(100, self.draw_map)
+            self.after(1000, self.draw_map)
         
 # --- Chat Tab ---
 class ChatTab(ttk.Frame):
@@ -3539,12 +3542,11 @@ class ChatTab(ttk.Frame):
         
         # --- Main Content Frame (Chat + Right Panel) ---
         main_content_frame = ttk.Frame(self, style='BlackGlass.TFrame')
-        main_content_frame.pack(padx=10, pady=(0, 10), fill=tk.BOTH, expand=True)
+        main_content_frame.pack(padx=(10, 0), pady=(0, 10), fill=tk.BOTH, expand=True)
 
-        # Configure 2 columns: Column 0 (Chat Log) weight 7, Column 1 (Minimap/Notification) weight 1.
-        # This enforces a 7:1 ratio, ensuring the chat log is dominant.
-        main_content_frame.grid_columnconfigure(0, weight=7) 
-        main_content_frame.grid_columnconfigure(1, weight=1) 
+        # Configure 2 columns: Column 0 (Chat Log) expands, Column 1 (Minimap/Notification) fixed width.
+        main_content_frame.grid_columnconfigure(0, weight=1) 
+        main_content_frame.grid_columnconfigure(1, weight=0, minsize=256) 
         main_content_frame.grid_rowconfigure(0, weight=1)
 
         # 1. Chat Display (Column 0, Row 0 - Expanding)
@@ -3552,11 +3554,15 @@ class ChatTab(ttk.Frame):
                                                      bg='#1C1C1C', fg='#E0E0E0', font=('Courier', 10), 
                                                      insertbackground='white', 
                                                      relief=tk.FLAT, highlightthickness=1, highlightbackground='#444444')
-        self.chat_display.grid(row=0, column=0, sticky='nsew', padx=(0, 5))
+        self.chat_display.grid(row=0, column=0, sticky='nsew', padx=(0, 0))
+        
+        # --- FIX: Configure tag for gray speaker name ---
+        self.chat_display.tag_config('speaker_name', foreground='#AAAAAA') 
+        # ------------------------------------------------
 
         # 2. Right Panel Frame (Column 1, Row 0 - Contains Notifications and Minimap)
         right_panel_frame = ttk.Frame(main_content_frame, style='BlackGlass.TFrame')
-        right_panel_frame.grid(row=0, column=1, sticky='nsew', padx=(5, 0))
+        right_panel_frame.grid(row=0, column=1, sticky='nsew', padx=(0, 0))
 
         # Configure rows in the Right Panel: Notifications (expanding) and Minimap (fixed height/square)
         right_panel_frame.grid_columnconfigure(0, weight=1)
@@ -3566,15 +3572,15 @@ class ChatTab(ttk.Frame):
         # 2a. Event Notifications Area (Row 0 - Takes up remaining vertical space)
         self.notification_area = LimitedScrolledText(right_panel_frame, max_lines=200, state='disabled', wrap=tk.WORD, height=5, 
                                                      bg='#1C1C1C', fg='#FFFF00', font=('Courier', 9), 
-                                                     width=20, # <--- FIX: Explicitly set a small width
+                                                     width=1, # <--- FIX: Explicitly set a small width so it doesn't push column width
                                                      relief=tk.FLAT, highlightthickness=1, highlightbackground='#444444')
         self.notification_area.insert(tk.END, "Event/Lure Notifications Here.\n(e.g., Teleport Offers)")
-        self.notification_area.grid(row=0, column=0, sticky='nsew', pady=(0, 5))
+        self.notification_area.grid(row=0, column=0, sticky='nsew', pady=(0, 0), padx=0)
 
         # 2b. Minimap Wrapper (Row 1 - Fixed at the bottom and forces square aspect)
         # Give it an initial size but let the grid manage its width
-        self.minimap_wrapper = ttk.Frame(right_panel_frame, style='BlackGlass.TFrame') # <--- FIX: Removed explicit width=200
-        self.minimap_wrapper.grid(row=1, column=0, sticky='sew') # Aligned bottom (s), expands horizontally (ew)
+        self.minimap_wrapper = ttk.Frame(right_panel_frame, style='BlackGlass.TFrame', width=256, height=256) # <--- FIX: Added explicit width/height=256
+        self.minimap_wrapper.grid(row=1, column=0, sticky='sew', padx=0, pady=0) # Aligned bottom (s), expands horizontally (ew)
         
         # Enforce square aspect ratio on the wrapper by binding Configure event
         self.minimap_wrapper.bind("<Configure>", self._enforce_square)
@@ -3670,7 +3676,8 @@ class ChatTab(ttk.Frame):
             
         elif message == "MINIMAP_UPDATE":
              # Use self.after to redraw safely from the main thread
-             self.after(0, self.minimap.draw_map) 
+             # REDUNDANT: MinimapCanvas already has a loop. Removing this prevents event queue flooding.
+             pass 
              
         elif message.startswith("[CHAT]"):
             # Some old scripts might still be sending messages prefix with [CHAT]
@@ -3690,7 +3697,11 @@ class ChatTab(ttk.Frame):
     def update_ui(self, update_type, message):
         """Thread-safe update of the GUI."""
         if update_type == "chat":
-            self.after(0, self._append_chat, message)
+            if isinstance(message, (list, tuple)) and len(message) == 2:
+                name, text = message
+                self.after(0, self._append_chat, text, name)
+            else:
+                self.after(0, self._append_chat, message)
         elif update_type == "chat_ack":
             # message is the sequence number
             seq_id = message
@@ -3708,7 +3719,7 @@ class ChatTab(ttk.Frame):
                 else:
                     name_label = from_name
                     
-                self.after(0, self._append_chat, f"[{name_label}]: {confirmed_msg}")
+                self.after(0, self._append_chat, confirmed_msg, name_label)
         elif update_type == "status":
             # This is primarily used for connection/teleport status updates
             self.after(0, self._update_status, message)
@@ -3758,9 +3769,16 @@ class ChatTab(ttk.Frame):
         # 2. (Future) Retroactive chat log updates could be implemented here if messages were tagged.
 
 
-    def _append_chat(self, message):
+    def _append_chat(self, message, name=None):
         self.chat_display.config(state='normal')
-        self.chat_display.insert(tk.END, message + "\n")
+        
+        if name:
+            self.chat_display.insert(tk.END, "[")
+            self.chat_display.insert(tk.END, name, 'speaker_name')
+            self.chat_display.insert(tk.END, "]: " + message + "\n")
+        else:
+            self.chat_display.insert(tk.END, message + "\n")
+            
         self.chat_display.config(state='disabled')
         self.chat_display.see(tk.END) 
                 
