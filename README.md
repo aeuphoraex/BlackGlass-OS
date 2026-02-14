@@ -66,7 +66,7 @@ pip install Pillow
 Standard Libraries: tkinter, socket, threading, xmlrpc, ssl.
 
 # 🚀 Getting Started
-Clone the repository or download BlackGlass.py.
+Download the .exe file in Releases or clone the repository or download BlackGlass.py.
 ###
 ###
 Run the script:
