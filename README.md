@@ -7,9 +7,9 @@ It allows for local chat and teleportation (both by double clicking the minimap 
 
 Download the .exe file on the right in Releases to help test and improve this project!
 
-<img width="858" height="604" alt="image" src="https://github.com/user-attachments/assets/935c517c-f6cb-41d1-98d0-aad0d15f3879" />
+<img width="796" height="677" alt="image" src="https://github.com/user-attachments/assets/b0b95f37-ebe5-4bf9-89fa-7189834cf80e" />
 
-<img width="801" height="679" alt="image" src="https://github.com/user-attachments/assets/33c46de1-8986-45ee-b47d-823e8a762595" />
+<img width="799" height="677" alt="image" src="https://github.com/user-attachments/assets/ba1c358c-ff1f-4cfc-abf5-3e439991a523" />
 
 BlackGlass is a lightweight, high-performance Second Life client focused on multi-avatar chat management, navigation, and regional awareness. Built with a "Black Glass" aesthetic using Python and Tkinter, it provides a streamlined alternative to heavy 3D viewers for users who prioritize communication and efficiency.
 
