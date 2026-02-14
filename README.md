@@ -1,4 +1,4 @@
-# BlackGlass
+# BlackGlass 1.1
 
 <img width="250" height="250" alt="ChatGPT Image Feb 14, 2026, 02_46_18 PM" src="https://github.com/user-attachments/assets/338a9692-3446-439f-8360-9b5044780745" />
 
@@ -80,6 +80,9 @@ Login: Enter your avatar's First Name, Last Name, and Password.
 Set the Start Region to last, home, or a specific region name.
 ###
 Manage Profiles: Your credentials will be saved automatically for quick access in the "Saved Profile" dropdown.
+
+# 🪙 Credits
+Used early draft version of following library >>> https://github.com/FelixWolf/pymetaverse/tree/master
 
 # ⚖️ Disclaimer
 BlackGlass is an independent project and is not affiliated with, endorsed by, or sponsored by Linden Research (Linden Lab). Use this client at your own risk and ensure compliance with the Second Life Terms of Service.
