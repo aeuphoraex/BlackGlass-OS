@@ -7,9 +7,6 @@ It allows for local chat and teleportation (both by double clicking the minimap 
 
 Download the .exe file on the right in Releases to help test and improve this project!
 ###
-<img width="796" height="677" alt="image" src="https://github.com/user-attachments/assets/b0b95f37-ebe5-4bf9-89fa-7189834cf80e" />
-
-<img width="799" height="677" alt="image" src="https://github.com/user-attachments/assets/ba1c358c-ff1f-4cfc-abf5-3e439991a523" />
 
 ###
 
@@ -28,7 +25,7 @@ Display Name Resolution: Asynchronously fetches and caches Second Life Display N
 
 Reliable Messaging: Implements packet acknowledgement (ACK) tracking to ensure your messages are confirmed by the simulator.
 
-🗺️ Navigation & Minimap
+## 🗺️ Navigation & Minimap
 
 Dynamic Minimap: A real-time 2D radar displaying your position and the locations of nearby avatars.
 
@@ -38,7 +35,7 @@ Double-Click Teleport: Double-click any location on the minimap to perform a "Ha
 
 GridSurvey Integration: Uses the Gridsurvey API as a fallback to resolve region coordinates and handles when in-world lookups fail.
 
-🛠️ Technical Prowess
+## 🛠️ Technical Prowess
 
 Custom Protocol Implementation: Built-in support for Second Life's Zero-Coding scheme, Low/Medium/High frequency message IDs, and LLSD XML parsing.
 
@@ -48,7 +45,7 @@ Robust Connection: Features automated handshake retries (UseCircuitCode, Complet
 
 Credential Security: Saves profiles locally using a repeating-key XOR cipher and Base64 encoding for basic password persistence.
 
-📸 Interface Preview
+## 📸 Interface Preview
 
 The UI features a high-contrast "Black Glass" theme with:
 
@@ -58,6 +55,9 @@ Interactive Sidebar: Real-time event notifications (teleport offers, lures) and 
 
 Consolidated Login: A dedicated "New Login" tab with saved profile management.
 
+<img width="796" height="677" alt="image" src="https://github.com/user-attachments/assets/b0b95f37-ebe5-4bf9-89fa-7189834cf80e" />
+
+<img width="799" height="677" alt="image" src="https://github.com/user-attachments/assets/ba1c358c-ff1f-4cfc-abf5-3e439991a523" />
 
 # 🛠️ Requirements
 Download the .exe compile at Releases or use Python: 3.7+
