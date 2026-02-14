@@ -55,7 +55,7 @@ Consolidated Login: A dedicated "New Login" tab with saved profile management.
 
 
 # 🛠️ Requirements
-Python: 3.7+
+Download the .exe compile at Releases or use Python: 3.7+
 
 Pillow (PIL): Required for minimap image rendering.
 
