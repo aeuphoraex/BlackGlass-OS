@@ -1,4367 +1,1129 @@
-import tkinter as tk
-from tkinter import scrolledtext, messagebox, simpledialog, Toplevel
-import threading
-import time
 import sys
-import struct
-import socket
-import uuid as __uuid__
-import xmlrpc.client
-import hashlib
-import traceback
-import random
-import ssl
-from uuid import UUID, getnode as get_mac
-from tkinter import ttk 
+import asyncio
+
+# Critical Windows UDP Stability Fix (Prevents ProactorEventLoop Datagram Crash)
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+import time
+import threading
 import json
-import os
 import base64
 import math
+import random
+import re
+import uuid as _uuid
 import urllib.request
-import urllib.parse 
-from io import BytesIO
+import urllib.parse
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# --- PIL/Pillow Import ---
-try:
-    from PIL import Image, ImageTk, ImageDraw
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
-    print("Warning: Pillow (PIL) not found. Map tiles will display a colored placeholder.")
-# --- End PIL Import ---
-
+# Hippolyzer Core Imports
+from hippolyzer.lib.base.message.message import Message, Block
+from hippolyzer.lib.base.datatypes import Vector3, Quaternion, UUID
+from hippolyzer.lib.base.templates import ChatType, ChatSourceType, IMDialogType
+from hippolyzer.lib.client.hippo_client import HippoClient, StartLocation
 
 # ==========================================
-# SECTION 1: CORE TYPES (llTypes.py)
+# SECTION 1: SMART INPUT PARSER
 # ==========================================
 
-# --- Performance Fix: Limited ScrolledText ---
-class LimitedScrolledText(scrolledtext.ScrolledText):
-    """
-    A ScrolledText widget that limits the number of lines it displays
-    to prevent memory bloat and UI lag over time.
-    """
-    def __init__(self, master=None, max_lines=1000, **kw):
-        super().__init__(master, **kw)
-        self.max_lines = max_lines
-
-    def insert(self, index, chars, *args):
-        super().insert(index, chars, *args)
-        self._prune()
-
-    def _prune(self):
-        """Removes the oldest lines if we exceed max_lines."""
-        # Get the number of lines (returns string like "100.0")
-        try:
-            # "end-1c" because "end" includes the auto-newline at the end
-            num_lines = int(float(self.index("end-1c")))
-            if num_lines > self.max_lines:
-                # Delete from start to the number of excess lines
-                diff = num_lines - self.max_lines
-                # We can delete chunks to be more efficient, but line-by-line 
-                # or block deletion logic:
-                # Delete from 1.0 to (1.0 + diff lines)
-                self.delete("1.0", f"{float(diff + 1)}.0")
-        except Exception:
-            pass
-# ---------------------------------------------
-
-class null:
-    def __bytes__(self):
-        return b""
-    def __str__(self):
-        return "<NULL>"
-
-class fixed:
-    data = b""
-    def __init__(self, data):
-        if type(data) == bytes:
-            self.data = data
-        elif type(data) == str:
-            # Improvement: Use utf-8 for protocol strings
-            self.data = data.encode("utf-8")
-        elif hasattr(data, "__bytes__"):
-            self.data = bytes(data)
-        else:
-            self.data = type(data).encode("utf-8")
-    def __bytes__(self):
-        return self.data
-    def __len__(self):
-        return len(self.data)
-    def __str__(self):
-        try:
-            return self.data.decode("utf-8") # Decoded with utf-8
-        except:
-            return "<FIXED: %i>"%len(self.data)
-
-class variable:
-    data = b""
-    type = 0
-    def __init__(self, ty = 1, data = b"", add_null = False):
-        
-        # --- FIX: Ensure Correct UTF-8 Encoding and Null Termination ---
-        if type(data) == bytes:
-            self.data = data
-        elif type(data) == str:
-            # FIX: Only encode and null-terminate if requested and if not already present.
-            # Use utf-8 for protocol strings
-            if add_null and not data.endswith('\x00'):
-                self.data = (data + '\x00').encode("utf-8")
-            else:
-                self.data = data.encode("utf-8")
-                
-        elif hasattr(data, "__bytes__"):
-            self.data = bytes(data)
-        else:
-            self.data = type(data).encode("utf-8")
-        # --- END FIX ---
-            
-        self.type = ty
-        if ty == 1:
-            if len(self.data) >= 256: # Changed to 256 to allow a 255 length string + null
-                # Should raise error or truncate
-                pass 
-        elif ty == 2:
-            if len(self.data) >= 65536: # Changed to 65536 to allow a 65535 length string + null
-                # Should raise error or truncate
-                pass
-    def __bytes__(self):
-        # The length prefix includes the null terminator which is part of the data
-        if self.type == 1:
-            return struct.pack("<B", len(self.data)) + self.data
-        elif self.type == 2:
-            return struct.pack("<H", len(self.data)) + self.data
-        # Fallback (same as type 1)
-        return struct.pack("<B", len(self.data)) + self.data
-    def __len__(self):
-        # The length of the data *only* (excluding the prefix)
-        return len(self.data)
-    def __str__(self):
-        try:
-            # Decoded with utf-8, strip the null terminator
-            return self.data.decode("utf-8").rstrip('\x00') 
-        except:
-            return "<VARIABLE %i: %i>"%(self.type,len(self.data))
-    def __repr__(self):
-        return "<VARIABLE %i: %i>"%(self.type,len(self.data))
-
-class vector3:
-    x = 0; y = 0; z = 0
-    def __init__(self, x=0, y=0, z=0):
-        self.x = x; self.y = y; self.z = z
-    def __bytes__(self):
-        return struct.pack("<fff", self.x, self.y, self.z)
-    def __str__(self):
-        return "<%f, %f, %f>"%(self.x, self.y, self.z)
-    def __eq__(self, cmp):
-        if type(cmp) != vector3: return False
-        return self.x == cmp.x and self.y == cmp.y and self.z == cmp.z
-
-class vector3d(vector3):
-    def __bytes__(self):
-        return struct.pack("<ddd", self.x, self.y, self.z)
-    def __eq__(self, cmp):
-        if type(cmp) != vector3d: return False
-        return self.x == cmp.x and self.y == cmp.y and self.z == cmp.z
-
-class vector4:
-    x = 0; y = 0; z = 0; s = 0
-    def __init__(self, x=0, y=0, z=0, s=0):
-        self.x = x; self.y = y; self.z = z; self.s = s
-    def __bytes__(self):
-        return struct.pack("<ffff", self.x, self.y, self.z, self.s)
-    def __str__(self):
-        return "<%f, %f, %f, %f>"%(self.x, self.y, self.z, self.s)
-
-class quaternion:
-    x = 0; y = 0; z = 0; w = 1
-    def __init__(self, x=0, y=0, z=0, w=1):
-        self.x = x; self.y = y; self.z = z; self.w = w
-    def __bytes__(self):
-        return struct.pack("<ffff", self.x, self.y, self.z, self.w)
-    def __str__(self):
-        return "<%f, %f, %f, %f>"%(self.x, self.y, self.z, self.w)
-
-rotation = quaternion
-
-class color4U:
-    r = 0; g = 0; b = 0; a = 0
-    def __init__(self, r=0, g=0, b=0, a=0):
-        self.r = r; self.g = g; self.b = b; self.a = a
-    def __bytes__(self):
-        return struct.pack("<BBBB", self.r, self.g, self.b, self.a)
-
-class LLUUID:
-    UUID = __uuid__.UUID("00000000-0000-0000-0000-000000000000")
-    def __init__(self, key = "00000000-0000-0000-0000-000000000000"):
-        if type(key) == bytes:
-            if len(key) == 16:
-                self.UUID = __uuid__.UUID(bytes=key)
-        elif type(key) == str:
-            self.UUID = __uuid__.UUID(key)
-        elif isinstance(key, __uuid__.UUID):
-            self.UUID = key
-    def __bytes__(self):
-        return self.UUID.bytes
-    def __str__(self):
-        return str(self.UUID)
-    def __len__(self):
-        return 16
-    @property
-    def bytes(self): 
-        return self.UUID.bytes
-    def __eq__(self, other):
-        if not isinstance(other, LLUUID): return False
-        return self.UUID == other.UUID
-
-class IPAddr:
-    addr = [0,0,0,0]
-    def __init__(self, a=0,b=0,c=0,d=0):
-        if type(a) == str:
-            a = a.split(".")
-            if len(a) == 4:
-                b = int(a[1]); c = int(a[2]); d = int(a[3]); a = int(a[0])
-        self.addr = [a,b,c,d]
-    def __bytes__(self):
-        return struct.pack("BBBB", self.addr[0], self.addr[1], self.addr[2], self.addr[3])
-    def __str__(self):
-        return "%i.%i.%i.%i"%(self.addr[0], self.addr[1], self.addr[2], self.addr[3])
-
-class IPPort:
-    port = 0
-    def __init__(self, a=0):
-        if type(a) == str: a = int(a)
-        self.port = a
-    def __bytes__(self):
-        return struct.pack("<H", self.port)
-    def __str__(self):
-        return str(self.port)
-
-def llDecodeType(t, ty = None):
-    a = type(t)
-    if a == null or a == fixed or a == variable or a == vector3 or \
-        a == vector3d or a == vector4 or a == quaternion or a == LLUUID or \
-        a == IPAddr or a == IPPort:
-        return bytes(t)
-    elif a == bytes:
-        return t
-    elif ty == "U8": return struct.pack("<B", t)
-    elif ty == "U16": return struct.pack("<H", t)
-    elif ty == "U32": return struct.pack("<I", t)
-    elif ty == "U64": return struct.pack("<Q", t)
-    elif ty == "S8": return struct.pack("<b", t)
-    elif ty == "S16": return struct.pack("<h", t)
-    elif ty == "S32": return struct.pack("<i", t)
-    elif ty == "S64": return struct.pack("<q", t)
-    elif ty == "F32": return struct.pack("<f", t)
-    elif ty == "F64": return struct.pack("<d", t)
-    elif ty == "BOOL" or t == bool: return struct.pack(">B", 1 if t == True else 0)
-    return b""
-
-def llEncodeType(t, ty = None, vlen = None):
-    if ty == "Null": return null()
-    # If t is already a Variable or Fixed object, this returns the object
-    # If t is bytes, it creates the object from the bytes
-    elif ty == "Fixed": return fixed(t)
-    # When decoding Variable, t is the bytes *with* the length prefix already stripped by the load() function
-    # So we pass the bytes and the correct type (vlen)
-    elif ty == "Variable": return variable(vlen, t) 
-    elif ty == "U8": return struct.unpack("<B", t)[0]
-    elif ty == "U16": return struct.unpack("<H", t)[0]
-    elif ty == "U32": return struct.unpack("<I", t)[0]
-    elif ty == "U64": return struct.unpack("<Q", t)[0]
-    elif ty == "S8": return struct.unpack("<b", t)[0]
-    elif ty == "S16": return struct.unpack("<h", t)[0]
-    elif ty == "S32": return struct.unpack("<i", t)[0]
-    elif ty == "S64": return struct.unpack("<q", t)[0]
-    elif ty == "F32": return struct.unpack("<f", t)[0]
-    elif ty == "F64": return struct.unpack("<d", t)[0]
-    elif ty == "LLVector3":
-        tmp = struct.unpack("<fff", t)
-        return vector3(tmp[0],tmp[1],tmp[2])
-    elif ty == "LLVector3d":
-        tmp = struct.unpack("<ddd", t)
-        return vector3d(tmp[0],tmp[1],tmp[2])
-    elif ty == "LLVector4":
-        tmp = struct.unpack("<ffff", t)
-        return vector4(tmp[0],tmp[1],tmp[2],tmp[3])
-    elif ty == "LLQuaternion":
-        tmp = struct.unpack("<ffff", t) # Corrected to 4 floats
-        return quaternion(tmp[0],tmp[1],tmp[2],tmp[3])
-    elif ty == "IPAddr":
-        tmp = struct.unpack("BBBB", t)
-        return IPAddr(tmp[0],tmp[1],tmp[2],tmp[3])
-    elif ty == "IPPort":
-        return IPPort(struct.unpack("<H", t)[0])
-    elif ty == "BOOL":
-        return struct.unpack("B", t)[0] != 0
-    elif ty == "LLUUID":
-        return LLUUID(t)
-    return t
-
-# ==========================================
-# SECTION 2: UTILITIES (zerocode, errorHandler, constraints)
-# ==========================================
-
-def zerocode_decode(bytedata):
-    """
-    Decodes a byte string compressed with Second Life's zero-coding scheme.
-    A null byte (\x00) followed by a non-zero byte C is replaced by C null bytes.
-    """
-    output = bytearray()
-    i = 0
-    l = len(bytedata)
-    
-    while i < l:
-        if bytedata[i] != 0:
-            output.append(bytedata[i])
-            i += 1
-            continue
-        
-        # Found null byte (marker)
-        output.append(0x00) 
-        i += 1
-        
-        # Check for count byte. If next byte is non-zero, it is the count (C extra nulls).
-        if i < l:
-            count = bytedata[i] 
-            # Insert the C extra nulls
-            output.extend(b"\x00" * count)
-            i += 1 # Skip the count byte
-            
-    return bytes(output)
-
-def zerocode_encode(bytedata):
-    """
-    Encodes a byte string using Second Life's zero-coding scheme.
-    A run of nulls (\x00\x00...) is replaced by a null marker (\x00) followed by a count byte (C).
-    C is the count of EXTRA nulls after the marker.
-    """
-    output = bytearray() 
-    i = 0
-    l = len(bytedata)
-    
-    while i < l:
-        if bytedata[i] != 0:
-            output.append(bytedata[i])
-            i += 1
-            continue
-        
-        # Found first null byte (the marker)
-        output.append(0x00) 
-        i += 1
-        
-        # Count consecutive nulls (c is the count of EXTRA nulls)
-        c = 0 
-        # Max run length is 255 (marker + 254 extra). We cap C at 254.
-        while i < l and bytedata[i] == 0 and c < 254: 
-            c += 1
-            i += 1
-        
-        # If c >= 0 (meaning 1 or more consecutive nulls total), insert count byte for the extra nulls
-        # Note: Even for a single null (c=0), we append the count byte (0) to maintain 
-        # consistency with the decoder which ALWAYS expects a count byte after a null marker.
-        output.append(c) 
-        
-    return bytes(output)
-
-def printsafe(data):
-    result = ""
-    for i in data:
-        if 0x20 <= i <= 0x7E:
-            result = result + chr(i)
-        else:
-            result = result + "."
-    return result
-
-def hexdump(data):
-    info = ""
-    l = len(data)
-    for i in range(0, l, 0x10):
-        hexdump = ""
-        for x in range(i, i+0x8 if i+0x8 <= l else l):
-            hexdump = hexdump + "{0:02X} ".format(data[x])
-        hexdump = hexdump + " "
-        for x in range(i+0x8, i+0x10 if i+0x10 <= l else l):
-            hexdump = hexdump + "{0:02X} ".format(data[x])
-        info = info + "{0:04X}     {1: <49s}     {2:s}\n".format(i, hexdump, printsafe(data[i:i+0x10]))
-    return info
-
-def packetErrorTrace(data):
-    a = traceback.format_exc()
-    if not a: return "Error: No error"
-    try:
-        flags, seq, exlen = struct.unpack_from(">BIB", data, 0)
-        mid = struct.unpack_from(">I", data, 6+exlen)[0]
-        return "%s\nMID:%s\n%s"%(a, mid, ("-"*79)+"\n"+hexdump(data)+"\n"+("-"*79))
-    except:
-        return "%s\n%s"%(a, ("-"*79)+"\n"+hexdump(data)+"\n"+("-"*79))
-
-
-class Constraints:
-    def __init__(self):
-        # Only essential ones for this script's functionality are defined here for brevity
-        self.CHAT_NORMAL = 1
-        # NEW CHAT CONSTANTS FOR FILTERING
-        self.CHAT_START_TYPING = 4 
-        self.CHAT_STOP_TYPING = 5
-        
-        # New/Expanded Movement Control Flags (U32)
-        # These are used in the AgentUpdate packet's ControlFlags field
-        self.AGENT_CONTROL_AT_POS = 0x01   # Forward (W, Arrow Up)
-        self.AGENT_CONTROL_AT_NEG = 0x02   # Backward (S, Arrow Down)
-        self.AGENT_CONTROL_LEFT_POS = 0x04 # Left (A, Arrow Left)
-        self.AGENT_CONTROL_RIGHT_POS = 0x08# Right (D, Arrow Right)
-        self.AGENT_CONTROL_UP_POS = 0x10   # Up (E, PageUp)
-        self.AGENT_CONTROL_UP_NEG = 0x20   # Down (C, PageDown)
-        self.AGENT_CONTROL_LBUTTON = 0x40
-        self.AGENT_CONTROL_MLBUTTON = 0x80
-        self.AGENT_CONTROL_JUMP = 0x100    # Jump (Space)
-        self.AGENT_CONTROL_FLY = 0x200     # Fly/Ground Toggle (F)
-        self.AGENT_CONTROL_MOUSELOOK = 0x400 # Mouselook Toggle
-        # Full list from constraints.py would go here...
-
-const = Constraints()
-
-# ==========================================
-# SECTION 3: AUTHENTICATION
-# ==========================================
-
-def getMacAddress():
-    mac = get_mac()
-    return ':'.join(("%012X" % mac)[i:i+2] for i in range(0, 12, 2))
-
-__PLATFORM_STRING__ = "Win"
-if sys.platform == "linux": __PLATFORM_STRING__ = "Lnx"
-elif sys.platform == "darwin": __PLATFORM_STRING__ = "Mac"
-
-# This is the correct, default login URI from the pyverse authentication.py file
-LOGIN_URI = "https://login.agni.lindenlab.com/cgi-bin/login.cgi" 
-SL_USER_AGENT = "BlackGlass"
-
-def login_to_simulator(firstname, lastname, password, mac=None, start="last", grid=None):
-    if grid is None: grid = LOGIN_URI
-    if mac == None: mac = getMacAddress()
-    
-    # Use default SSL context for verification
-    proxy = xmlrpc.client.ServerProxy(grid, verbose=False, use_datetime=True)
-    
-    # NOTE: The original pyverse code used CZ_Python channel, adjusting to SLViewer_Py as per the original SLViewer.py
-    result = proxy.login_to_simulator({
-        "first": firstname,
-        "last": lastname,
-        "passwd": "$1$"+hashlib.md5(password.encode("latin")).hexdigest(),
-        "start": start,
-        "platform": __PLATFORM_STRING__,
-        "mac": mac,
-        "id0": hashlib.md5(("%s:%s:%s"%(__PLATFORM_STRING__,mac,sys.version)).encode("latin")).hexdigest(),
-        "agree_to_tos": True,
-        "last_exec_event": 0,
-        "viewer_protocol_version": "2.0.0",
-        "channel": "BlackGlass",
-        "version": "7.1.9.74745",
-        "options": ["inventory-root", "buddy-list", "login-flags", "global-textures", "display-names"]
-    })
-    if result["login"] != "true":
-        raise ConnectionError("Unable to log in:\n    %s"%(result["message"] if "message" in result else "Unknown error"))
-    return result
-
-# ==========================================
-# SECTION 4: MESSAGE DEFINITIONS (message.py & messages.py)
-# ==========================================
-
-baseTypes = {
-    "Null": null(), "Fixed": fixed(b""), "Variable": [None, variable(1, b""), variable(2, b"")],
-    "U8": 0, "U16": 0, "U32": 0, "U64": 0, "S8": 0, "S16": 0, "S32": 0, "S64": 0, "F32": 0.0, "F64": 0.0,
-    "LLVector3": vector3(), "LLVector3d": vector3d(), "LLVector4": vector4(),
-    "LLQuaternion": quaternion(), "LLUUID": LLUUID(), "BOOL": False,
-    "IPADDR": IPAddr(), "IPPORT": IPPort()
-}
-typeLengths = {
-    "Null": 0, "Fixed": 0, "Variable": 0, "Color4U": 4, "U8": 1, "U16": 2, "U32": 4, "U64": 8,
-    "S8": 1, "S16": 2, "S32": 4, "S64": 8, "F32": 4, "F64": 8,
-    "LLVector3": 12, "LLVector3d": 24, "LLVector4": 16, "LLQuaternion": 16,
-    "LLUUID": 16, "BOOL": 1, "IPADDR": 4, "IPPORT": 2
-}
-
-class BaseMessage:
-    name = "TestMessage"; id = 1; freq = 2; trusted = False; zero_coded = True
-    blocks = []; structure = {}
-    def __init__(self, data=None):
-        if not data:
-            for key in self.blocks:
-                if key[1] == 1: # Single block
-                    tmp = {}
-                    for value in self.structure[key[0]]:
-                        # FIX: Handle variable-sized types which have an index in baseTypes
-                        if value[1] == "Variable": tmp[value[0]] = baseTypes[value[1]][value[2]]
-                        else: tmp[value[0]] = baseTypes[value[1]]
-                    setattr(self, key[0], tmp)
-                else: # Multi block (Variable or Fixed count)
-                    setattr(self, key[0], [])
-        else:
-            self.load(data)
-    
-    def load(self, data):
-        # Heuristic fix for padded ObjectUpdateCompressed packets
-        offset_shift = 0
-        if self.name == "ObjectUpdateCompressed":
-             # Check if the count at the expected offset (10) is 0, but packet is large
-             # Expected offset 10 comes from RegionData (10 bytes)
-             if len(data) > 20 and data[10] == 0:
-#                 print(f"[DEBUG] Repositioning scanner for {self.name}...")
-                 for i in range(11, min(len(data), 64)):
-                     if data[i] != 0:
-                         # Found potential count
-#                         print(f"[DEBUG] Found non-zero byte {data[i]} at offset {i}. shifting...")
-                         # We need the scanner to arrive at 'i' when it wants to read the count.
-                         # The scanner is at 'offset' (which tracks key processing).
-                         # We can't easily change the loop behavior, but we can slide the data?
-                         # Or simpler: The scanner logic below uses 'offset'.
-                         # We can artificially increase 'offset' IF we are processing ObjectDate (key[1]==0).
-                         
-                         # Actually, we can just detect the padding and consume it explicitly?
-                         # But the structure is rigid.
-                         
-                         # Strategy: If we are here, we modify 'data' to remove padding?
-                         # No, 'RegionData' needs 10 bytes. The padding is AFTER RegionData?
-                         # i = new offset for count.
-                         # expected = 10.
-                         # padding = i - 10.
-                         
-                         # found potential count
-                         offset_shift = i - 10
-#                          print(f"[DEBUG] Shift detected: {offset_shift}. New count byte: {data[i]}")
-                         break
-                         
-        offset = 0
-        for key in self.blocks:
-            if key[1] == 1:
-                tmp = {}
-                for value in self.structure[key[0]]:
-                    tlen = 0
-                    if value[1] == "Variable":
-                        if value[2] == 1:
-                            tlen_prefix = struct.unpack_from("<B", data, offset)[0]
-                            offset += 1
-                        elif value[2] == 2:
-                            tlen_prefix = struct.unpack_from("<H", data, offset)[0]
-                            offset += 2
-                        tlen = tlen_prefix
-                    elif value[1] == "Fixed": tlen = value[2]
-                    else: tlen = typeLengths[value[1]]
-                    
-                    val_data = data[offset:offset+tlen]
-                    # FIX: Pass the Variable length type (1 or 2) to llEncodeType
-                    tmp[value[0]] = llEncodeType(val_data, value[1], value[2] if value[1]=="Variable" else None)
-                    offset += tlen
-                setattr(self, key[0], tmp)
-            else: # Variable count blocks (key[1] == 0) or Fixed count blocks (key[1] > 1)
-                
-                # Apply heuristic shift if this is the variable block and we detected padding
-                if self.name == "ObjectUpdateCompressed" and key[1] == 0 and offset_shift > 0:
-#                     print(f"[DEBUG] Applying offset shift {offset_shift} for ObjectData...")
-                    offset += offset_shift
-                
-                count = key[1]
-                if count == 0: # Variable count (always U8)
-                    count = struct.unpack_from(">B", data, offset)[0]; offset += 1
-                
-                outblock = []
-                for i in range(count):
-                    tmp = {}
-                    for value in self.structure[key[0]]:
-                        tlen = 0
-                        if value[1] == "Variable":
-                            if value[2] == 1:
-                                tlen_prefix = struct.unpack_from("<B", data, offset)[0]
-                                offset += 1
-                            elif value[2] == 2:
-                                tlen_prefix = struct.unpack_from("<H", data, offset)[0]
-                                offset += 2
-                            tlen = tlen_prefix
-                        elif value[1] == "Fixed": tlen = value[2]
-                        else: tlen = typeLengths[value[1]]
-                        
-                        val_data = data[offset:offset+tlen]
-                        # FIX: Pass the Variable length type (1 or 2) to llEncodeType
-                        tmp[value[0]] = llEncodeType(val_data, value[1], value[2] if value[1]=="Variable" else None)
-                        offset += tlen
-                    outblock.append(tmp)
-                setattr(self, key[0], outblock)
-
-    def __bytes__(self):
-        result = b""
-        for key in self.blocks:
-            if key[1] == 1:
-                tmp = getattr(self, key[0])
-                for value in self.structure[key[0]]:
-                    result += llDecodeType(tmp[value[0]], value[1])
-            else:
-                tmp = getattr(self, key[0])
-                if key[1] == 0: result += struct.pack("B", len(tmp))
-                for item in tmp:
-                    for value in self.structure[key[0]]:
-                        result += llDecodeType(item[value[0]], value[1])
-        return result
-
-message_lookup = {}
-def registerMessage(msg):
-    id = msg.id
-    if msg.freq == 1: id = id + 0xFF00
-    elif msg.freq == 2: id = id + 0xFFFF0000
-    message_lookup[id] = msg
-    message_lookup[msg.name.lower()] = msg
-
-def getMessageByID(key, data = None):
-    if key in message_lookup: return message_lookup[key](data=data)
-    else: return None
-
-def getMessageByName(key, data = None):
-    key = key.lower()
-    if key in message_lookup: return message_lookup[key](data=data)
-    else: return None
-
-# --- ESSENTIAL MESSAGES FOR CHAT/LOGIN/TELEPORT ---
-
-class UseCircuitCode(BaseMessage):
-    name = "UseCircuitCode"; id = 3; freq = 2; trusted = False; zero_coded = False
-    blocks = [("CircuitCode", 1)]
-    structure = {"CircuitCode": [("Code", "U32"), ("SessionID", "LLUUID"), ("ID", "LLUUID")]}
-registerMessage(UseCircuitCode)
-
-class CompleteAgentMovement(BaseMessage):
-    name = "CompleteAgentMovement"; id = 249; freq = 2; trusted = False; zero_coded = False
-    blocks = [("AgentData", 1)]
-    structure = {"AgentData": [("AgentID", "LLUUID"), ("SessionID", "LLUUID"), ("CircuitCode", "U32")]}
-registerMessage(CompleteAgentMovement)
-
-class RegionHandshake(BaseMessage):
-    # FIX: RegionHandshake is LowFrequency (2), ID is 0x105 (261)
-    # The previous ID 148 was incorrect for usage as LowFrequency ID 261?
-    # Actually, let's trust the PACKET ERROR log which looked for 4294902021 (0xFFFF0105).
-    name = "RegionHandshake"; id = 261; freq = 2; trusted = True; zero_coded = True
-    blocks = [("RegionInfo", 1), ("RegionInfo2", 1), ("RegionInfo3", 1), ("RegionInfo4", 0)]
-    structure = {
-        "RegionInfo": [("RegionFlags", "U32"), ("SimAccess", "U8"), ("SimName", "Variable", 1), ("SimOwner", "LLUUID"), ("IsEstateManager", "BOOL"), ("WaterHeight", "F32"), ("BillableFactor", "F32"), ("CacheID", "LLUUID"), ("TerrainBase0", "LLUUID"), ("TerrainBase1", "LLUUID"), ("TerrainBase2", "LLUUID"), ("TerrainBase3", "LLUUID"), ("TerrainDetail0", "LLUUID"), ("TerrainDetail1", "LLUUID"), ("TerrainDetail2", "LLUUID"), ("TerrainDetail3", "LLUUID"), ("TerrainStartHeight00", "F32"), ("TerrainStartHeight01", "F32"), ("TerrainStartHeight10", "F32"), ("TerrainStartHeight11", "F32"), ("TerrainHeightRange00", "F32"), ("TerrainHeightRange01", "F32"), ("TerrainHeightRange10", "F32"), ("TerrainHeightRange11", "F32")],
-        "RegionInfo2": [("RegionID", "LLUUID")],
-        "RegionInfo3": [("CPUClassID", "S32"), ("CPURatio", "S32"), ("ColoName", "Variable", 1), ("ProductSKU", "Variable", 1), ("ProductName", "Variable", 1)],
-        "RegionInfo4": [("RegionFlagsExtended", "U64"), ("RegionProtocols", "U64")]
-    }
-registerMessage(RegionHandshake)
-
-class RegionHandshakeReply(BaseMessage):
-    name = "RegionHandshakeReply"; id = 149; freq = 2; trusted = False; zero_coded = True
-    blocks = [("AgentData", 1), ("RegionInfo", 1)]
-    structure = {
-        "AgentData": [("AgentID", "LLUUID"), ("SessionID", "LLUUID")],
-        "RegionInfo": [("Flags", "U32")]
-    }
-registerMessage(RegionHandshakeReply)
-
-class ChatFromSimulator(BaseMessage):
-    name = "ChatFromSimulator"; id = 139; freq = 2; trusted = True; zero_coded = False
-    blocks = [("ChatData", 1)]
-    # Message field uses Variable, type 2, which allows for longer messages (up to 65535 bytes)
-    structure = {"ChatData": [("FromName", "Variable", 1), ("SourceID", "LLUUID"), ("OwnerID", "LLUUID"), ("SourceType", "U8"), ("ChatType", "U8"), ("Audible", "U8"), ("Position", "LLVector3"), ("Message", "Variable", 2)]}
-registerMessage(ChatFromSimulator)
-
-class ChatFromViewer(BaseMessage):
-    name = "ChatFromViewer"; id = 80; freq = 2; trusted = False; zero_coded = False
-    blocks = [("AgentData", 1), ("ChatData", 1)]
-    structure = {
-        "AgentData": [("AgentID", "LLUUID"), ("SessionID", "LLUUID")],
-        "ChatData": [("Message", "Variable", 2), ("Type", "U8"), ("Channel", "S32")]
-    }
-registerMessage(ChatFromViewer)
-
-class AgentThrottle(BaseMessage):
-    name = "AgentThrottle"; id = 81; freq = 2; trusted = False; zero_coded = True
-    blocks = [("AgentData", 1), ("Throttle", 1)]
-    structure = {
-        "AgentData": [("AgentID", "LLUUID"), ("SessionID", "LLUUID"), ("CircuitCode", "U32")],
-        # Throttles field is a Variable, type 1, containing the 7 floats
-        "Throttle": [("GenCounter", "U32"), ("Throttles", "Variable", 1)]
-    }
-registerMessage(AgentThrottle)
-
-class AgentFOV(BaseMessage):
-    name = "AgentFOV"; id = 82; freq = 2; trusted = False; zero_coded = False
-    blocks = [("AgentData", 1), ("FOVBlock", 1)]
-    structure = {
-        "AgentData": [("AgentID", "LLUUID"), ("SessionID", "LLUUID"), ("CircuitCode", "U32")],
-        "FOVBlock": [("GenCounter", "U32"), ("VerticalAngle", "F32")]
-    }
-registerMessage(AgentFOV)
-
-class AgentHeightWidth(BaseMessage):
-    name = "AgentHeightWidth"; id = 83; freq = 2; trusted = False; zero_coded = False
-    blocks = [("AgentData", 1), ("HeightWidthBlock", 1)]
-    structure = {
-        "AgentData": [("AgentID", "LLUUID"), ("SessionID", "LLUUID"), ("CircuitCode", "U32")],
-        "HeightWidthBlock": [("GenCounter", "U32"), ("Height", "U16"), ("Width", "U16")]
-    }
-registerMessage(AgentHeightWidth)
-
-class AgentUpdate(BaseMessage):
-    name = "AgentUpdate"; id = 4; freq = 0; trusted = False; zero_coded = True
-    blocks = [("AgentData", 1)]
-    structure = {"AgentData": [("AgentID", "LLUUID"), ("SessionID", "LLUUID"), ("BodyRotation", "LLQuaternion"), ("HeadRotation", "LLQuaternion"), ("State", "U8"), ("CameraCenter", "LLVector3"), ("CameraAtAxis", "LLVector3"), ("CameraLeftAxis", "LLVector3"), ("CameraUpAxis", "LLVector3"), ("Far", "F32"), ("ControlFlags", "U32"), ("Flags", "U8")]}
-registerMessage(AgentUpdate)
-
-class PacketAck(BaseMessage):
-    name = "PacketAck"; id = 4294967291; freq = 3; trusted = False; zero_coded = False
-    blocks = [("Packets", 0)]
-    structure = {"Packets": [("ID", "U32")]}
-registerMessage(PacketAck)
-
-class StartPingCheck(BaseMessage):
-    name = "StartPingCheck"; id = 1; freq = 0; trusted = False; zero_coded = False
-    blocks = [("PingID", 1)]
-    structure = {"PingID": [("PingID", "U8"), ("OldestUnacked", "U32")]}
-registerMessage(StartPingCheck)
-
-class CompletePingCheck(BaseMessage):
-    name = "CompletePingCheck"; id = 2; freq = 0; trusted = False; zero_coded = False
-    blocks = [("PingID", 1)]
-    structure = {"PingID": [("PingID", "U8")]}
-registerMessage(CompletePingCheck)
-
-class LogoutRequest(BaseMessage):
-    name = "LogoutRequest"; id = 252; freq = 2; trusted = False; zero_coded = False
-    blocks = [("AgentData", 1)]
-    structure = {"AgentData": [("AgentID", "LLUUID"), ("SessionID", "LLUUID")]}
-registerMessage(LogoutRequest)
-
-class TeleportFinish(BaseMessage):
-    name = "TeleportFinish"; id = 69; freq = 2; trusted = True; zero_coded = False
-    blocks = [("Info", 1)]
-    structure = {"Info": [("AgentID", "LLUUID"), ("LocationID", "U32"), ("SimIP", "IPADDR"), ("SimPort", "IPPORT"), ("RegionHandle", "U64"), ("SeedCapability", "Variable", 2), ("SimAccess", "U8"), ("TeleportFlags", "U32")]}
-registerMessage(TeleportFinish)
-
-class CloseCircuit(BaseMessage):
-    name = "CloseCircuit"; id = 4294967293; freq = 3; trusted = False; zero_coded = False
-    blocks = []
-    structure = {}
-registerMessage(CloseCircuit)
-
-# --- Teleport Messages ---
-
-class TeleportOffer(BaseMessage):
-    name = "TeleportOffer"; id = 71; freq = 2; trusted = True; zero_coded = True
-    blocks = [("Offer", 1)]
-    structure = {"Offer": [("TeleportID", "LLUUID"), ("FromAgentID", "LLUUID"), ("TargetPosition", "LLVector3"), ("RegionHandle", "U64"), ("SIMIP", "IPADDR"), ("SIMPort", "IPPORT"), ("L$Cost", "S32"), ("RegionName", "Variable", 1)]}
-registerMessage(TeleportOffer)
-
-class TeleportAccept(BaseMessage):
-    name = "TeleportAccept"; id = 73; freq = 2; trusted = False; zero_coded = True
-    blocks = [("AgentData", 1), ("Teleport", 1)]
-    structure = {
-        "AgentData": [("AgentID", "LLUUID"), ("SessionID", "LLUUID")],
-        "Teleport": [("TeleportID", "LLUUID"), ("LicenseAccepted", "BOOL"), ("L$Cost", "S32")]
-    }
-registerMessage(TeleportAccept)
-
-class TeleportLocationRequest(BaseMessage):
-    name = "TeleportLocationRequest"; id = 67; freq = 2; trusted = False; zero_coded = True
-    blocks = [("AgentData", 1), ("Info", 1)]
-    structure = {
-        "AgentData": [("AgentID", "LLUUID"), ("SessionID", "LLUUID")],
-        "Info": [("RegionHandle", "U64"), ("Position", "LLVector3"), ("LookAt", "LLVector3")]
-    }
-registerMessage(TeleportLocationRequest)
-
-class TeleportStart(BaseMessage):
-    name = "TeleportStart"; id = 59; freq = 2; trusted = True; zero_coded = True
-    blocks = [("Info", 1)]
-    structure = {"Info": [("TeleportFlags", "U32")]}
-registerMessage(TeleportStart)
-
-class TeleportProgress(BaseMessage):
-    name = "TeleportProgress"; id = 60; freq = 2; trusted = True; zero_coded = True
-    blocks = [("Info", 1), ("AgentData", 1)]
-    structure = {
-        "Info": [("TeleportFlags", "U32"), ("Message", "Variable", 1)],
-        "AgentData": [("AgentID", "LLUUID")]
-    }
-registerMessage(TeleportProgress)
-
-class TeleportFailed(BaseMessage):
-    name = "TeleportFailed"; id = 61; freq = 2; trusted = True; zero_coded = True
-    blocks = [("Info", 1), ("AlertInfo", 0)]
-    structure = {
-        "Info": [("Reason", "Variable", 1)],
-        "AlertInfo": [("ExtraParams", "Variable", 1)]
-    }
-registerMessage(TeleportFailed)
-
-registerMessage(TeleportFailed)
-
-# --- Map Lookup Messages ---
-
-class MapNameRequest(BaseMessage):
-    name = "MapNameRequest"; id = 66; freq = 2; trusted = False; zero_coded = True
-    blocks = [("AgentData", 1), ("RequestData", 1)]
-    structure = {
-        "AgentData": [("AgentID", "LLUUID"), ("SessionID", "LLUUID")],
-        # Name field uses Variable, type 1
-        "RequestData": [("Name", "Variable", 1), ("Flags", "U32")]
-    }
-registerMessage(MapNameRequest)
-
-class MapItemReply(BaseMessage):
-    name = "MapItemReply"; id = 100; freq = 2; trusted = True; zero_coded = True
-    blocks = [("AgentData", 1), ("Data", 0)]
-    structure = {
-        "AgentData": [("AgentID", "LLUUID"), ("SessionID", "LLUUID")],
-        "Data": [
-            ("X", "U16"), ("Y", "U16"), ("Handle", "U64"),
-            ("Name", "Variable", 1), ("Agents", "U8")
-        ]
-    }
-registerMessage(MapItemReply)
-
-# --- Agent Data Messages ---
-
-class AgentMovementComplete(BaseMessage):
-    name = "AgentMovementComplete"; id = 250; freq = 2; trusted = True; zero_coded = True
-    blocks = [("AgentData", 1), ("Data", 1)]
-    structure = {
-        "AgentData": [("AgentID", "LLUUID"), ("SessionID", "LLUUID")],
-        "Data": [
-            ("Position", "LLVector3"), ("LookAt", "LLVector3"), 
-            ("RegionHandle", "U64"), ("Timestamp", "U32")
-        ]
-    }
-registerMessage(AgentMovementComplete)
-
-class AgentDataRequest(BaseMessage):
-    name = "AgentDataRequest"; id = 225; freq = 2; trusted = False; zero_coded = True
-    blocks = [("AgentData", 1)]
-    structure = {"AgentData": [("AgentID", "LLUUID"), ("SessionID", "LLUUID")]}
-registerMessage(AgentDataRequest)
-
-class AgentDataUpdate(BaseMessage):
-    name = "AgentDataUpdate"; id = 156; freq = 2; trusted = True; zero_coded = True
-    blocks = [("AgentData", 1)]
-    structure = {
-        "AgentData": [
-            ("AgentID", "LLUUID"), ("SessionID", "LLUUID"), 
-            ("FirstName", "Variable", 1), ("LastName", "Variable", 1),
-            ("GroupMask", "U32"), ("AbilityMask", "U32"), ("GodLevel", "U8")
-        ]
-    }
-registerMessage(AgentDataUpdate)
-
-# --- Object/Self Position Update Messages (For Minimap) ---
-
-class ImprovedTerseObjectUpdate(BaseMessage):
-    name = "ImprovedTerseObjectUpdate"; id = 4294967292; freq = 3; trusted = False; zero_coded = True
-    blocks = [("RegionData", 1), ("ObjectData", 0)]
-    structure = {
-        "RegionData": [("RegionHandle", "U64"), ("TimeDilation", "U16"), ("TimeSinceLastUpdate", "U16")],
-        "ObjectData": [
-            ("ID", "U32"), 
-            ("CRC", "U32"),
-            ("Data", "Variable", 1) # Variable length data block containing position/rotation/etc.
-        ]
-    }
-registerMessage(ImprovedTerseObjectUpdate)
-
-class ObjectUpdate(BaseMessage):
-    # FIX: Frequency is 0 (High Priority / 1-byte ID) for ObjectUpdate (ID 16)
-    name = "ObjectUpdate"; id = 16; freq = 0; trusted = True; zero_coded = True
-    blocks = [("RegionData", 1), ("ObjectData", 0)]
-    structure = {
-        "RegionData": [("RegionHandle", "U64"), ("TimeDilation", "U16")],
-        "ObjectData": [
-            ("ID", "U32"), ("State", "U8"), ("FullID", "LLUUID"), ("CRC", "U32"), ("PCode", "U8"),
-            ("Material", "U8"), ("ClickAction", "U8"), ("Scale", "LLVector3"), ("ObjectData", "Variable", 1),
-            ("ParentID", "U32"), ("UpdateFlags", "U32"), ("PathCurve", "U8"), ("ProfileCurve", "U8"),
-            ("PathBegin", "U16"), ("PathEnd", "U16"), ("PathScaleX", "U8"), ("PathScaleY", "U8"),
-            ("PathShearX", "U8"), ("PathShearY", "U8"), ("PathTwist", "S8"), ("PathTwistBegin", "S8"),
-            ("PathRadiusOffset", "S8"), ("PathTaperX", "S8"), ("PathTaperY", "S8"), ("PathRevolutions", "U8"),
-            ("PathSkew", "S8"), ("ProfileBegin", "U16"), ("ProfileEnd", "U16"), ("ProfileHollow", "U16"),
-            ("TextureEntry", "Variable", 2), ("TextureAnim", "Variable", 1), ("NameValue", "Variable", 1),
-            ("Data", "Variable", 2), ("Text", "Variable", 1), ("TextColor", "Color4U"),
-            ("MediaURL", "Variable", 1), ("ParticleSystem", "Variable", 1), ("ExtraParams", "Variable", 1),
-            ("Sound", "LLUUID"), ("OwnerID", "LLUUID"), ("SoundGain", "F32"), ("SoundRadius", "U8"),
-            ("SoundFlags", "U8"), ("JointType", "U8"), ("JointPivot", "LLVector3"), ("JointAxisOrAnchor", "LLVector3")
-        ]
-    }
-registerMessage(ObjectUpdate)
-
-class ObjectUpdateCompressed(BaseMessage):
-    name = "ObjectUpdateCompressed"; id = 17; freq = 1; trusted = True; zero_coded = True
-    blocks = [("RegionData", 1), ("ObjectData", 0)]
-    structure = {
-        "RegionData": [("RegionHandle", "U64"), ("TimeDilation", "U16")],
-        "ObjectData": [
-            ("UpdateFlags", "U32"), ("Data", "Variable", 1)
-        ]
-    }
-registerMessage(ObjectUpdateCompressed)
-
-class CoarseLocationUpdate(BaseMessage):
-    # FIX: Medium Frequency (1) for CoarseLocationUpdate
-    name = "CoarseLocationUpdate"; id = 6; freq = 1; trusted = False; zero_coded = False
-    blocks = [("Location", 0), ("Index", 0)]
-    structure = {
-        "Location": [("X", "U8"), ("Y", "U8"), ("Z", "U8")],
-        "Index": [("You", "S16"), ("Prey", "S16")]
-    }
-registerMessage(CoarseLocationUpdate)
-
-class ImagePacket(BaseMessage):
-    name = "ImagePacket"; id = 11; freq = 0; trusted = False; zero_coded = True
-    blocks = [("ImageID", 1), ("ImageData", 1)]
-    structure = {
-        "ImageID": [("ID", "LLUUID"), ("Codec", "U8"), ("Packet", "U16"), ("Packets", "U16")],
-        "ImageData": [("Data", "Variable", 2)]
-    }
-registerMessage(ImagePacket)
-
-# --- KICKUSER PACKET ---
-class KickUser(BaseMessage):
-    # This is a high-frequency (2), trusted message
-    name = "KickUser"; id = 244; freq = 2; trusted = True; zero_coded = True
-    blocks = [("UserInfo", 1), ("TargetBlock", 1)]
-    structure = {
-        "UserInfo": [("AgentID", "LLUUID"), ("SessionID", "LLUUID")],
-        # Reason field uses Variable, type 2, which allows for longer messages
-        "TargetBlock": [("Reason", "Variable", 2), ("TargetID", "LLUUID")]
-    }
-registerMessage(KickUser)
-# --- END KICKUSER PACKET ---
-
-
-# ==========================================
-# SECTION 5: PACKET HANDLING (packet.py)
-# ==========================================
-
-class Packet:
-    bytes = b""; body = None; MID = 0; sequence = 0; extra = b""
-    flags = 0; zero_coded = 0; reliable = 0; resent = 0; ack = True
-    
-    def __init__(self, data=None, message=None, mid=0, sequence=0, zero_coded=0, reliable=0, resent=0, ack=0, acks=[]):
-        self.acks = [] # FIX: Ensure ACKs don't accumulate in class attribute
-        if data:
-            self.flags, self.sequence, self.extra_bytes = struct.unpack_from(">BIB", data[:6])
-            self.zero_coded = (self.flags&0x80 == 0x80)
-            self.reliable = (self.flags&0x40 == 0x40)
-            self.resent = (self.flags&0x20 == 0x20)
-            self.ack = (self.flags&0x10 == 0x10)
-            self.extra = data[6:6+self.extra_bytes]
-            
-            payload = data[6+self.extra_bytes:]
-            
-            # --- FIX: Extract MID BEFORE zero-coding decoding ---
-            # This is critical because the MID is NOT zero-coded, but the rest of the body is.
-            # If the MID contains \x00, zero-decoding it would corrupt the packet structure.
-            
-            mid_raw = 0
-            mid_offset = 0
-            if payload[0] == 0xFF:
-                if payload[1] == 0xFF: # High/Fixed frequency (4 bytes)
-                    mid_raw = struct.unpack(">I", payload[:4])[0]
-                    mid_offset = 4
-                else: # Medium frequency (2 bytes)
-                    mid_raw = struct.unpack(">H", payload[:2])[0]
-                    mid_offset = 2
-            else: # Low frequency (1 byte)
-                mid_raw = payload[0]
-                mid_offset = 1
-
-            # Save the raw MID bytes for later use in decoding the body
-            self.MID = mid_raw
-            body_payload = payload[mid_offset:]
-
-            if self.zero_coded: self.bytes = zerocode_decode(body_payload)
-            else: self.bytes = body_payload
-            
-            realID = mid_raw
-            offset = 0 # body_payload already starts after the MID
-            
-            # Re-determine frequency-adjusted ID for message lookup
-            if mid_raw & 0xFFFFFFFA == 0xFFFFFFFA: # Fixed-frequency packet (3)
-                pass 
-            elif mid_raw & 0xFFFF0000 == 0xFFFF0000: # High-frequency packet (2)
-                realID = (mid_raw & 0x0000FFFF) + 0xFFFF0000
-            elif mid_raw & 0xFFFFFF00 == 0xFFFF0000: # Wait, mid_raw for freq 1 is 2 bytes?
-                # Actually frequency logic is easier if we use the bits:
-                pass
-            
-            # Simplified Frequency/ID logic matching SL protocol:
-            if mid_raw < 0xFF: # Low frequency
-                realID = mid_raw
-            elif mid_raw < 0xFFFF: # Medium
-                realID = mid_raw # mid_raw already has the 0xFF prefix if 2 bytes
-            else: # High or Fixed
-                realID = mid_raw # mid_raw already has the 0xFFFF prefix if 4 bytes
-            # Use the determined offset to get the body data
-            # DEBUG: Print exact ID resolution
-            # print(f"[PACKET DEBUG] MID Raw: {mid_raw} RealID: {realID}")
-            
-            self.body = getMessageByID(realID, self.bytes[offset:])
-            
-            # DEBUG: Diagnose missing body
-            if self.body is None:
-#                  print(f"[PACKET ERROR] ID {realID} (Raw {mid_raw}) not found in lookup.")
-                 # Create a dummy body to prevent crashes in handleInternalPackets
-                 class DummyBody: name="UnknownID"
-                 self.body = DummyBody()
-
-            if not self.body: 
-                self.body = type('UnknownMessage', (object,), {'name': 'Unknown'})()
-
-            if self.ack:
-                try:
-                    ackcount = data[len(data)-1]
-                    ack_offset = len(data) - (ackcount * 4) - 1
-                    for i in range(ackcount):
-                        self.acks.append(struct.unpack_from(">I", data, ack_offset)[0])
-                        ack_offset += 4
-                except: 
-                    pass # Handle malformed ACK data
-        elif message:
-            self.MID = message.id
-            if len(acks) > 0 or ack: self.ack = True
-            self.zero_coded = message.zero_coded
-            self.sequence = sequence
-            self.body = message
-            self.acks = acks
-            self.reliable = getattr(message, 'trusted', False) # Set reliable from message metadata
-            if reliable: self.reliable = True # Override if explicitly set as reliable
-            if resent: self.resent = True
-
-    def __bytes__(self):
-        self.flags = 0
-        body = bytes(self.body)
-        
-        # 1. Zero-coding
-        if self.zero_coded:
-            tmp = zerocode_encode(body)
-            # FIX: The check here should compare encoded length to original body length
-            if len(tmp) >= len(body):
-                self.zero_coded = False; self.flags &= ~0x80 # Don't zero-code if it makes it larger
-                # Re-encode body without zero-coding
-                body = bytes(self.body) 
-            else:
-                self.flags |= 0x80
-                body = tmp
-        
-        # 2. Set Flags
-        if self.reliable: self.flags |= 0x40
-        if self.resent: self.flags |= 0x20
-        if self.ack: self.flags |= 0x10
-        
-        # 3. ACK bytes
-        acks_bytes = b""
-        if self.ack:
-            for i in self.acks: acks_bytes += struct.pack(">I", i)
-            # Only pack the count if there are actual ACKs
-            if len(self.acks) > 0:
-                acks_bytes += struct.pack(">B", len(self.acks)) # Corrected to B (U8) for the count
-            else:
-                self.flags &= ~0x10 # Clear the ACK flag if no ACKs were packed
-                acks_bytes = b""
-        
-        # 4. Message ID (MID)
-        result = b""
-        if self.body.freq == 3: result = struct.pack(">I", self.MID)
-        elif self.body.freq == 2: result = struct.pack(">I", self.MID + 0xFFFF0000)
-        elif self.body.freq == 1: result = struct.pack(">H", self.MID + 0xFF00)
-        elif self.body.freq == 0: result = struct.pack(">B", self.MID)
-        
-        # 5. Full Packet Assembly
-        return struct.pack(">BIB", self.flags, self.sequence, len(self.extra)) + self.extra + result + body + acks_bytes
-
-# ==========================================
-# SECTION 6: NETWORK LAYER (UDPStream.py as RegionClient)
-# ==========================================
-
-class RegionClient:
-    host = ""; port = 0; clientPort = 0; sock = None
-    agent_id = None; session_id = None; loginToken = {}
-    nextPing = 0; nextAck = 0; nextAgentUpdate = 0
-    sequence = 1; acks = []
-    circuit_code = None; debug = False
-    
-    # Existing control variables (now updated by the Agent via methods)
-    controls = 0; controls_once = 0 
-    
-    sim = {}
-    log_callback = None
-    
-    # --- New variables for Handshake Retries ---
-    handshake_complete = False
-    last_circuit_send = 0 
-    last_update_send = 0
-    circuit_packet = None 
-    circuit_sequence = 0 
-    
-    # NEW: Tracking for CompleteAgentMovement (CAM)
-    cam_packet = None
-    last_cam_send = 0
-    cam_sequence = 0
-    
-    # NEW: General Reliable Packet Tracking
-    reliable_packets = {} 
-
-    # NEW: Thread-safe primitives for map lookup
-    teleport_lookup_lock = threading.Lock()
-    teleport_lookup_event = threading.Event()
-    teleport_lookup_result = None
-    teleport_lookup_target_name = None 
-
-    # NEW: Agent position data (For Minimap)
-    agent_x = 128.0
-    agent_y = 128.0
-    agent_z = 30.0
-    agent_rot_z = 0.0 # yaw only for minimap (radians)
-    
-    # NEW: Global Grid Coordinates for Map Fetching
-    grid_x = 1000
-    grid_y = 1000
-    local_id = 0 # NEW: Store the simulator-assigned LocalID for the agent
-
-    # NEW: List to store positions of other avatars [(x, y, z), ...]
-    other_avatars = []
-    
-    # NEW: Capability storage
-    capabilities = {}
-    seed_cap_url = ""
-
-    # MODIFIED: Added log_callback to constructor
-    def __init__(self, loginToken, host="0.0.0.0", port=0, debug=False, log_callback=None):
-        self.debug = debug
-        self.log_callback = log_callback if log_callback is not None else lambda msg: None
-        self.other_avatars = [] # Initialize list
-        self.local_id = 0 # Reset local_id
-        
-        if loginToken.get("login") != "true":
-            raise ConnectionError("Unable to log into simulator: %s" % loginToken.get("message", "Unknown"))
-        
-        self.loginToken = loginToken
-        self.host = loginToken["sim_ip"]
-        self.port = loginToken["sim_port"]
-        self.session_id = LLUUID(loginToken["session_id"])
-        self.agent_id = LLUUID(loginToken["agent_id"])
-        
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        self.sock.settimeout(1.0)
-        # Using 0.0.0.0 allows listening on all interfaces
-        self.sock.bind((host, port))
-        
-        # The circuit_code from login token is a string (e.g., "1234567"), need to pack the integer value
-        self.circuit_code = int(loginToken["circuit_code"])
-        
-        # Capture Seed Capability URL
-        self.seed_cap_url = loginToken.get("seed_capability", "")
-        # FIX: Capture all initial capabilities provided at login time
-        self.capabilities = loginToken.get("capabilities", {}).copy()
-        self.log(f"Seed Capability obtained: {self.seed_cap_url}")
-        self.log(f"Initial capabilities: {list(self.capabilities.keys())}")
-
-        # Extract initial region grid coordinates (in meters) and convert to tile coordinates
-        # Default is Da Boom (1000, 1000) if missing
-        
-        try:
-            val_x = loginToken.get("region_x", 0)
-            val_y = loginToken.get("region_y", 0)
-            
-            r_x = int(float(val_x))
-            r_y = int(float(val_y))
-        except Exception as e:
-            self.log(f"Coord Parse Error: {e}")
-            r_x = 0; r_y = 0
-            
-        if r_x > 0 and r_y > 0:
-            self.grid_x = r_x // 256
-            self.grid_y = r_y // 256
-        else:
-            # If coordinates are missing, we default to 0, 0 to trigger the fallback lookup mechanism
-            self.log_callback("[CHAT] Warning: Region coordinates missing/invalid. Defaulting to (0, 0).")
-            self.grid_x = 0
-            self.grid_y = 0
-        
-        
-        self.last_circuit_send = 0 # Forces an immediate send on first loop iteration
-
-    @property
-    def seq(self):
-        self.sequence += 1
-        return self.sequence - 1
-    
-    def log(self, message):
-        """Helper function to route messages via the callback."""
-        if self.debug:
-            self.log_callback(f"DEBUG: {message}")
-    
-    def send_use_circuit_code(self):
-        # *** FIX: Store and reuse the packet and sequence number ***
-        if self.circuit_packet is None:
-            # First time: generate and store the packet
-            msg = getMessageByName("UseCircuitCode")
-            msg.CircuitCode["Code"] = self.circuit_code
-            msg.CircuitCode["SessionID"] = self.session_id
-            msg.CircuitCode["ID"] = self.agent_id
-            
-            self.circuit_sequence = self.seq 
-            # The use of ack=False is important here to ensure no acks are piggybacked on the first packet.
-            # FIX: Ensure reliable=True is explicitly set for handshake packets
-            self.circuit_packet = Packet(sequence=self.circuit_sequence, message=msg, reliable=True, ack=False)
-        
-        # Resend the stored packet (with the original sequence number)
-        self.send(self.circuit_packet)
-        self.last_circuit_send = time.time()
-
-    def send_complete_movement(self):
-        # *** NEW: Store and reuse the CAM packet and sequence number ***
-        if self.cam_packet is None:
-            # First time: generate and store the packet
-            msg = getMessageByName("CompleteAgentMovement")
-            msg.AgentData["AgentID"] = self.agent_id
-            msg.AgentData["SessionID"] = self.session_id
-            msg.AgentData["CircuitCode"] = self.circuit_code
-            
-            self.cam_sequence = self.seq 
-            # FIX: Ensure reliable=True is explicitly set for handshake packets
-            self.cam_packet = Packet(sequence=self.cam_sequence, message=msg, reliable=True, ack=False)
-        
-        # Resend the stored packet (with the original sequence number)
-        self.send(self.cam_packet)
-        self.last_cam_send = time.time()
-        
-    def send_teleport_accept(self, teleport_id, cost=0, license=True):
-        msg = getMessageByName("TeleportAccept")
-        msg.AgentData["AgentID"] = self.agent_id
-        msg.AgentData["SessionID"] = self.session_id
-        msg.Teleport["TeleportID"] = teleport_id
-        msg.Teleport["LicenseAccepted"] = license
-        msg.Teleport["L$Cost"] = cost
-        # TeleportAccept must be reliable, sending directly via send will use the new logic
-        self.send(msg, reliable=True) 
-        return True
-
-    # MODIFIED: Logic moved to _teleport_lookup_task, this is just a stub for Agent usage
-    def teleport_to_region(self, region_name, region_handle, position):
-        """Sends the final TeleportRequest packet."""
-        
-        # Try TeleportRequest (ID 66) instead of TeleportLocationRequest (ID 67)
-        msg = getMessageByName("TeleportRequest")
-        
-        msg.AgentData["AgentID"] = self.agent_id
-        msg.AgentData["SessionID"] = self.session_id
-
-        msg.Info["RegionHandle"] = region_handle
-        msg.Info["Position"] = position
-        msg.Info["LookAt"] = vector3(0.0, 1.0, 0.0)
-
-        # IMPORTANT: TeleportRequest should be reliable and acknowledged
-        self.send(msg, reliable=True)
-        self.log(f"Sent TeleportRequest to handle {region_handle}")
-        return True
-
-    # MODIFIED: Logic added to trigger MAP_FETCH_TRIGGER on RegionHandshake
-    def handleInternalPackets(self, pck):
-        if not hasattr(pck.body, 'name'):
-             self.log_callback(f"[SPY] Body Invalid: {type(pck.body)}")
-             return
-            
-        if pck.body.name == "UnknownID":
-             if self.local_id == 0:
-                 self.log_callback(f"[SPY] Unrecognized ID: {pck.MID}")
-             return
-
-        # Packet Spy: Log all named packets until we find ourselves
-        if self.local_id == 0:
-             self.log_callback(f"[SPY] Packet: {pck.body.name} (ID {pck.MID})")
-        
-        # NEW: Process ACKs in the received packet
-        for seq_id in pck.acks:
-            if seq_id in self.reliable_packets:
-                del self.reliable_packets[seq_id]
-                self.log(f"ACK received for reliable packet {seq_id}.")
-                self.log(f"ACK_CONFIRMED: {seq_id}") # Trigger UI notification
-
-        if pck.body.name == "PacketAck":
-            # Process dedicated PacketAck messages
-            for block in pck.body.Packets:
-                seq_id = block["ID"]
-                if seq_id in self.reliable_packets:
-                    del self.reliable_packets[seq_id]
-                    self.log(f"Dedicated ACK received for reliable packet {seq_id}.")
-                    self.log(f"ACK_CONFIRMED: {seq_id}") # Trigger UI notification
-
-        elif pck.body.name == "MapItemReply":
-            # NEW: Handle MapItemReply for active lookup
-            if self.teleport_lookup_target_name is not None:
-                with self.teleport_lookup_lock:
-                    target_name = self.teleport_lookup_target_name
-                    
-                    # Search through the blocks for a matching region name
-                    for block in pck.body.Data:
-                        # Ensure comparison is case-insensitive, robust to variable encoding
-                        # FIX: Need to strip the null terminator from MapItemReply too!
-                        if safe_decode_llvariable(block["Name"]).lower() == target_name: 
-                            # *** FIX: Check if we already have a result. If so, don't overwrite
-                            if self.teleport_lookup_result is None:
-                                self.teleport_lookup_result = block
-                                self.teleport_lookup_event.set() # Signal the waiting thread
-                            return
-            
-        elif pck.body.name == "ObjectUpdate":
-            # Capture LocalID from ObjectUpdate to enable Terse updates
-            for block in pck.body.ObjectData:
-                # Check if this object is ME
-                # Note: FullID might be under 'FullID' or similar depending on the block type
-                # FIX: Use dictionary access and compare UUID bytes or string
-                full_id = block.get("FullID")
-                
-                # DIAGNOSTIC: Log all ObjectUpdate IDs to see if we are missed
-#                 print(f"[OBJ] ObjectUpdate Candidate: {full_id} vs {self.agent_id}")
-                
-                if full_id and str(full_id) == str(self.agent_id):
-                    self.local_id = block["ID"]
-#                     print(f"[DEBUG] LocalID Captured from ObjectUpdate: {self.local_id}")
-                    self.log_callback("MINIMAP_UPDATE")
-                    break
-
-        elif pck.body.name == "ObjectUpdateCompressed":
-            # Handle Compressed Updates - Try to find ourselves in the blob
-            # self.log_callback(f"[DEBUG] Received ObjectUpdateCompressed!")
-#             print(f"[DEBUG] ObjectUpdateCompressed: {len(pck.body.ObjectData)} objects")
-            
-            for block in pck.body.ObjectData:
-                 data_blob = block["Data"].data
-                 # DIAGNOSTIC: Hexdump start of blob
-#                  print(f"[COMP] Blob Len: {len(data_blob)}")
-#                  print(hexdump(data_blob[:64]))
-                 
-                 # SEARCH for our UUID in the blob
-                 search_target = self.agent_id.bytes
-                 search_target_rev = self.agent_id.bytes[::-1]
-#                  print(f"[DEBUG] Searching for AgentID: {self.agent_id} in blob ({len(data_blob)} bytes)")
-                 
-                 found_idx = -1
-                 if search_target in data_blob:
-                     found_idx = data_blob.find(search_target)
-#                      print(f"[DEBUG] FOUND AGENT UUID (Normal) at offset {found_idx}")
-                 elif search_target_rev in data_blob:
-                     found_idx = data_blob.find(search_target_rev)
-                     # If reversed, we might need to handle LocalID differently if endianness is flipped?
-#                      print(f"[DEBUG] FOUND AGENT UUID (Reversed) at offset {found_idx}")
-                 
-                 if found_idx >= 0:
-                     # Heuristic: LocalID is usually the 4 bytes BEFORE the UUID in some compressed formats, 
-                     # or part of the header. 
-                     # In ObjectUpdateCompressed, UpdateFlags are first.
-                     # Let's dump surrounding bytes to ID the LocalID.
-                     pass
-                     # The structure of ObjectData is: UpdateFlags (U32), Data (Variable).
-                     # The first field in Data IS NOT LocalID?
-                     # Wait. In libomv, ObjectUpdateCompressed.ObjectData class has:
-                     # UpdateFlags, Data.
-                     # Decompressed Data has: UUID, LocalID, PCode, etc. depending on flags.
-                     # UUID is usually near the START if it's sent.
-                     
-                     # If we found UUID at offset `idx`.
-                     # LocalID is typically *before* UUID? Or after?
-                     # Let's try to extract candidates.
-                     
-                     # Diagnostic dump around the UUID
-                     start_dump = max(0, idx - 16)
-                     end_dump = min(len(data_blob), idx + 32)
-#                      print(f"[DEBUG] Dump around UUID:\n{hexdump(data_blob[start_dump:end_dump])}")
-                     
-                     # Heuristic: If we haven't found LocalID yet, try to guess it.
-                     # Usually LocalID is U32.
-                     
-                     # If we assume this is us, let's TRY using it.
-                     # We need to find the LocalID to use Terse updates.
-                     # Let's wait for the heuristic log to tell us where it is structure-wise.
-                     pass
-            
-        elif pck.body.name == "ImprovedTerseObjectUpdate":
-            for block in pck.body.ObjectData:
-                # Match against the captured LocalID or heuristic
-                is_me = False
-                if self.local_id != 0:
-                    is_me = (block["ID"] == self.local_id)
-                # Removed the bad fallback logic
-                
-                if is_me:
-                    data = block["Data"].data 
-                    # self.log_callback(f"[DEBUG] Terse Update for ME. Len={len(data)}")
-                    
-                    if len(data) >= 12:
-                        try:
-                            # Standard Avatar Interpretation (Offset 1, 12 bytes float)
-                            # Or maybe Offset 0?
-                            # Try to find reasonable coordinates
-                            # Debug dump
-                            # self.log_callback(f"[DEBUG] Terse Hex: {data.hex()}")
-                            
-                            if len(data) >= 13: # Heuristic check for uncompressed
-                                px, py, pz = struct.unpack("<fff", data[0:12]) # TRY OFFSET 0
-                                # If silly values, try offset 1
-                                if px > 1000 or py > 1000:
-                                     px, py, pz = struct.unpack("<fff", data[1:13])
-                                
-                                # Normalizing: if values are > 256, they are likely global.
-                                # Region local is always 0.0-256.0.
-                                if px > 256: px %= 256
-                                if py > 256: py %= 256
-                                
-                                self.agent_x, self.agent_y = px, py
-                                # self.log_callback(f"[CHAT] Own Pos: {px:.1f}, {py:.1f}")
-                                self.log_callback("MINIMAP_UPDATE")
-                                break
-                            
-                            # Compressed Interpretation (Offset 0, 4 bytes U16)
-                            px_raw, py_raw = struct.unpack("<HH", data[0:4])
-                            px, py = px_raw / 256.0, py_raw / 256.0
-                            self.agent_x, self.agent_y = px, py
-                            # self.log_callback(f"[CHAT] Own Pos (comp): {px:.1f}, {py:.1f}")
-                            self.log_callback("MINIMAP_UPDATE")
-                        except:
-                            pass
-                    break
-        
-        elif pck.body.name == "CoarseLocationUpdate":
-            # Handle other avatars for minimap
-            new_avatars = []
-            
-            # The sim typically sends 'Location' block.
-            location_blocks = getattr(pck.body, 'Location', [])
-            if not location_blocks:
-                location_blocks = getattr(pck.body, 'AgentData', [])
-            
-            # Check for the 'Index' block to identify our own avatar
-            my_index = -1
-            index_blocks = getattr(pck.body, 'Index', [])
-            
-            if index_blocks and len(index_blocks) > 0:
-                # The 'You' field in CoarseLocationUpdate/Index is S16
-                raw_index = index_blocks[0].get("You", -1)
-                
-                # REVERTED HACK: Trust the raw index, but only if reasonable positive
-                if raw_index >= 0:
-                    my_index = raw_index
-#                 print(f"[COARSE DEBUG] 'You' Index: {raw_index} -> Used: {my_index} (Locs: {len(location_blocks)})")
-            
-            for i, block in enumerate(location_blocks):
-                if 'X' in block and 'Y' in block:
-                    x = block['X']
-                    y = block['Y']
-                    z = block.get('Z', 0)
-                    
-                    # Fix: Ensure my_index is an int and compare correctly
-                    if i == int(my_index):
-                        # print(f"[COARSE DEBUG] Updating SELF pos: {x}, {y}")
-                        # We use Coarse as a fallback for self pos
-                        self.agent_x = float(x)
-                        self.agent_y = float(y)
-                    else:
-                        new_avatars.append((x, y, z))
-                
-            self.other_avatars = new_avatars
-            self.log_callback("MINIMAP_UPDATE")
-
-        elif pck.body.name == "AgentMovementComplete":
-            pos = pck.body.Data["Position"]
-            self.agent_x = pos.x
-            self.agent_y = pos.y
-            self.agent_z = pos.z
-            # self.log(f"[DEBUG] Location updated via AgentMovementComplete: {pos.x:.1f}, {pos.y:.1f}")
-            self.log_callback("MINIMAP_UPDATE")
-
-        elif pck.body.name == "AgentDataUpdate":
-            # AgentDataUpdate usually doesn't have Position in this freq/id combo, but we handle it safely
-            pass
-
-        elif pck.body.name == "StartPingCheck":
-            msg = getMessageByName("CompletePingCheck")
-            msg.PingID["PingID"] = pck.body.PingID["PingID"]
-            self.send(msg)
-            
-        elif pck.body.name == "RegionHandshake":
-            self.handshake_complete = True # Signal that Handshake is done!
-            self.sim['name'] = str(pck.body.RegionInfo["SimName"])
-            
-            # self.acks.append(self.circuit_sequence) # REMOVED: Correct ACK logic is via received ACKs or PacketAck
-            self.circuit_packet = None # No longer need to resend the circuit code
-            self.cam_packet = None # ADDED: Clear CAM state
-
-            msg = getMessageByName("RegionHandshakeReply")
-            msg.AgentData["AgentID"] = self.agent_id
-            msg.AgentData["SessionID"] = self.session_id
-            msg.RegionInfo["Flags"] = 0
-            self.send(msg)
-            
-            # Send initial state information
-            self.throttle()
-            self.setFOV()
-            self.setWindowSize()
-            
-            # --- RECOMMENDED FIX: Send a reliable AgentUpdate immediately post-handshake ---
-            # This confirms the client's state and location, often resolving a silent sim info deadlock.
-            self.agentUpdate(controls=0, reliable=True)
-            # --- END RECOMMENDED FIX ---
-            
-            # --- NEW: Request Agent Data for initial location ---
-            self.requestAgentData()
-            
-            # --- MAP FETCH TRIGGER ---
-            # Trigger map fetch whenever a RegionHandshake is successfully processed.
-            if PIL_AVAILABLE: 
-                self.ui_callback("status", f"Handshake complete. Fetching map for {self.sim['name']}...")
-                self.fetch_map(self.sim['name'])
-            else:
-                 self.ui_callback("status", f"Handshake complete. Map unavailable (PIL missing).")
-            # --- END MAP FETCH TRIGGER ---
-            
-            # --- FIX: Send the successful login status to the UI ---
-            self.log_callback(f"HANDSHAKE_COMPLETE, {self.sim['name']}")
-
-        elif pck.body.name == "TeleportStart":
-            self.ui_callback("status", "🚀 Teleport sequence started...")
-            self.log("TeleportStart received.")
-
-        elif pck.body.name == "TeleportProgress":
-            msg = getattr(pck.body.Info, 'Message', b'').decode('utf-8', errors='ignore').strip()
-            self.ui_callback("status", f"⏳ Teleport progress: {msg}")
-            self.log(f"TeleportProgress: {msg}")
-
-        elif pck.body.name == "TeleportFailed":
-            reason = getattr(pck.body.Info, 'Reason', b'').decode('utf-8', errors='ignore').strip()
-            self.ui_callback("status", f"❌ Teleport Failed: {reason}")
-            self.log(f"TeleportFailed: {reason}")
-            # --- END FIX ---
-            
-        # --- KICKUSER HANDLING (NEW) ---
-        elif pck.body.name == "KickUser":
-            reason = safe_decode_llvariable(pck.body.TargetBlock.get('Reason', 'Unknown reason from sim.'))
-            self.log_callback(f"KICKED, {reason}")
-        # --- END KICKUSER HANDLING ---
-
-        elif pck.body.name == "TeleportFinish":
-            # Update seed capability if available in TeleportFinish
-            if hasattr(pck.body, 'Info'):
-                self.seed_cap_url = safe_decode_llvariable(pck.body.Info.get("SeedCapability", ""))
-                self.capabilities = {} # Reset caps for the new region
-                self.log(f"Updated Seed Capability to {self.seed_cap_url}")
-
-        if pck.reliable:
-            self.acks.append(pck.sequence)
-        
-        # Only run network maintenance if handshake is still incomplete
-        if not self.handshake_complete:
-            if time.time() > self.nextAck: self.sendAcks()
-
-    def recv(self):
-        try:
-            # Original socket timeout is 1.0s, which is fine for the main loop
-            blob = self.sock.recv(65507) 
-            try: pck = Packet(data=blob)
-            except Exception as e: 
-                # Log deserialization error using the debug flag
-                if self.debug: self.log_callback(f"ERROR: Packet deserialization error: {e}")
-                if self.debug: self.log_callback(packetErrorTrace(blob))
-                return None
-            
-            # DIAGNOSTIC: Log processed packet ID
-#             print(f"[RAW-RECV] MID: {pck.MID}, Name: {pck.body.name}, Freq: {getattr(pck.body, 'freq', '?')}")
-            
-            self.handleInternalPackets(pck)
-            return pck
-        except socket.timeout:
-            return None
-        except Exception as e:
-            if self.debug: self.log_callback(f"ERROR: Socket error: {e}")
-            return None
-
-    def send(self, blob, reliable=False): # ADD reliable argument
-        if type(blob) is not Packet:
-            # If a Message object is passed, wrap it in a Packet
-            
-            # Determine reliability from argument or message property
-            if reliable or getattr(blob, 'trusted', False): 
-                 reliable = True
-                 
-            # Piggyback any accumulated ACKs on this packet
-            acks_to_send = self.acks[:255]
-            if acks_to_send:
-                self.acks = self.acks[255:]
-                self.nextAck = time.time() + 1
-            
-            # Create the packet
-            blob = Packet(sequence=self.seq, message=blob, acks=acks_to_send, ack=bool(acks_to_send), reliable=reliable)
-
-        # NEW: Track outgoing reliable packets
-        # Do not track handshake packets here, they are tracked separately for initial connection
-        if blob.reliable and blob.sequence not in [self.circuit_sequence, self.cam_sequence]:
-            # Store the full packet object and the time it was last sent
-            self.reliable_packets[blob.sequence] = (blob, time.time())
-            
-        try:
-            # If blob is a Packet (like self.circuit_packet or self.cam_packet), it is sent as-is.
-            self.sock.sendto(bytes(blob), (self.host, self.port))
-            return blob.sequence
-        except Exception as e: 
-            if self.debug: self.log_callback(f"ERROR: Send error: {e}")
-            return False
-
-    def logout(self):
-        msg = getMessageByName("LogoutRequest")
-        msg.AgentData["AgentID"] = self.agent_id
-        msg.AgentData["SessionID"] = self.session_id
-        self.send(msg)
-
-    def sendAcks(self):
-        if len(self.acks) > 0:
-            msg = getMessageByName("PacketAck")
-            tmp = self.acks[:255]
-            self.acks = self.acks[255:]
-            msg.Packets = [{"ID": i} for i in tmp]
-            self.send(msg)
-            self.nextAck = time.time() + 1
-
-    def throttle(self):
-        msg = getMessageByName("AgentThrottle")
-        msg.AgentData["AgentID"] = self.agent_id
-        msg.AgentData["SessionID"] = self.session_id
-        msg.AgentData["CircuitCode"] = self.circuit_code
-        msg.Throttle["GenCounter"] = 0
-        # 7 floats: Resend, Land, Wind, Cloud, Task, Texture, Asset
-        floats = struct.pack("<fffffff", 150000.0, 170000.0, 34000.0, 34000.0, 446000.0, 446000.0, 220000.0)
-        # FIX: The Variable field must be an object of type 'variable' which wraps the bytes.
-        msg.Throttle["Throttles"] = variable(1, floats)
-        self.send(msg)
-
-    def setFOV(self):
-        msg = getMessageByName("AgentFOV")
-        msg.AgentData["AgentID"] = self.agent_id
-        msg.AgentData["SessionID"] = self.session_id
-        msg.AgentData["CircuitCode"] = self.circuit_code
-        msg.FOVBlock["GenCounter"] = 0
-        msg.FOVBlock["VerticalAngle"] = 6.28
-        self.send(msg)
-
-    def setWindowSize(self):
-        msg = getMessageByName("AgentHeightWidth")
-        msg.AgentData["AgentID"] = self.agent_id
-        msg.AgentData["SessionID"] = self.session_id
-        msg.AgentData["CircuitCode"] = self.circuit_code
-        msg.HeightWidthBlock["GenCounter"] = 0
-        msg.HeightWidthBlock["Height"] = 768
-        msg.HeightWidthBlock["Width"] = 1024
-        self.send(msg)
-    
-    # MODIFIED: Added reliable=False to the signature
-    def agentUpdate(self, controls=0, reliable=False): 
-        msg = getMessageByName("AgentUpdate")
-        msg.AgentData["AgentID"] = self.agent_id
-        msg.AgentData["SessionID"] = self.session_id
-        
-        # NOTE: Using corrected identity quaternion (0,0,0,1)
-        body_rotation = quaternion(0.0, 0.0, 0.0, 1.0) 
-        
-        msg.AgentData["BodyRotation"] = body_rotation
-        msg.AgentData["HeadRotation"] = body_rotation
-        msg.AgentData["State"] = 0
-        # Use the agent's actual position for the camera center
-        msg.AgentData["CameraCenter"] = vector3(self.agent_x, self.agent_y, self.agent_z)
-        msg.AgentData["CameraAtAxis"] = vector3(0,1,0)
-        msg.AgentData["CameraLeftAxis"] = vector3(1,0,0)
-        msg.AgentData["CameraUpAxis"] = vector3(0,0,1)
-        msg.AgentData["Far"] = 1024.0
-        msg.AgentData["ControlFlags"] = controls
-        msg.AgentData["Flags"] = 0
-        self.send(msg, reliable=reliable)
-        self.last_update_send = time.time()
-        
-    def requestAgentData(self):
-        msg = getMessageByName("AgentDataRequest")
-        msg.AgentData["AgentID"] = self.agent_id
-        msg.AgentData["SessionID"] = self.session_id
-        self.send(msg)
-        
-    def fetch_capabilities(self, cap_names):
-        """Fetches capability URLs from the seed capability."""
-        if not self.seed_cap_url: return
-        
-        try:
-            msg = f"Requesting capabilities {cap_names} from {self.seed_cap_url}..."
-            self.log(msg)
-
-            
-            headers = {
-                'User-Agent': SL_USER_AGENT,
-                'Accept': 'application/llsd+json, application/llsd+xml',
-                'X-SecondLife-Agent-ID': str(self.agent_id),
-                'X-SecondLife-Session-ID': str(self.session_id)
-            }
-            
-            def _do_fetch(payload, content_type):
-                h = headers.copy()
-                if content_type: h['Content-Type'] = content_type
-                req = urllib.request.Request(self.seed_cap_url, data=payload, headers=h)
-                try:
-                    with urllib.request.urlopen(req, timeout=10) as response:
-                        if response.getcode() == 200:
-                            return response.read().decode('utf-8')
-                except Exception as ex:
-#                     print(f"DEBUG: Fetch attempt failed: {ex}")
-                    pass
-                return None
-
-            payload_xml = render_llsd_xml(cap_names).encode('utf-8')
-            resp_data = _do_fetch(payload_xml, 'application/llsd+xml')
-            
-            if resp_data:
-                self.log(f"Raw capability response: {resp_data}")
-#                 print(f"DEBUG: Capability response: {resp_data}") # Fallback
-                
-                if resp_data.strip().startswith('<'):
-                    new_caps = parse_llsd_xml(resp_data)
-                else:
-                    new_caps = json.loads(resp_data)
-
-                # NEW: If any of our requested caps are missing, try a GET on the seed URL.
-                # Many simulators respond to GET with the FULL list of available caps.
-                missing_some = any(c not in new_caps and (not isinstance(new_caps.get('Metadata'), dict) or c not in new_caps['Metadata']) for c in cap_names)
-                
-                if missing_some:
-                    missing_list = [c for c in cap_names if c not in new_caps and (not isinstance(new_caps.get('Metadata'), dict) or c not in new_caps['Metadata'])]
-                    self.log(f"Some caps missing ({missing_list}). Retrying with GET on SeedCap...")
-
-                    resp_data_get = _do_fetch(None, None) # GET request
-                    if resp_data_get:
-                        self.log(f"Raw GET capability response (first 200 chars): {resp_data_get[:200]}...")
-#                         print(f"DEBUG: GET Capability response (first 200 chars): {resp_data_get[:200]}...")
-                        if resp_data_get.strip().startswith('<'):
-                            new_caps_get = parse_llsd_xml(resp_data_get)
-                        else:
-                            new_caps_get = json.loads(resp_data_get)
-                        
-                        if isinstance(new_caps_get, dict):
-                            # Flatten Metadata in GET response as well
-                            if 'Metadata' in new_caps_get and isinstance(new_caps_get['Metadata'], dict):
-                                self.capabilities.update(new_caps_get['Metadata'])
-                            self.capabilities.update(new_caps_get)
-                            new_caps.update(new_caps_get)
-                            self.log(f"Merged GET capabilities. Total now: {len(self.capabilities)}")
-                    else:
-#                         print("DEBUG: GET fallback returned no data.")
-                        pass
-
-                if isinstance(new_caps, dict):
-                    # FIX: Flatten the Metadata map if returned
-                    if 'Metadata' in new_caps and isinstance(new_caps['Metadata'], dict):
-                        self.log("Flattening Metadata map from capability response.")
-                        self.capabilities.update(new_caps['Metadata'])
-                    
-                    self.capabilities.update(new_caps)
-                    self.log(f"Fetched capabilities: {list(new_caps.keys())}")
-                else:
-                    self.log(f"Unexpected capability response format: {type(new_caps)}")
-            else:
-                self.log("Capability fetch failed or returned no data.")
-        except Exception as e:
-            err = f"Error fetching capabilities: {e}"
-            self.log(err)
-#            print(f"ERROR: {err}")
-
-def parse_llsd_xml(xml_str):
-    """
-    Very basic LLSD XML to Python dict/list parser.
-    Supports <map>, <key>, <string>, <array>, <integer>, <boolean>.
-    """
-    import xml.etree.ElementTree as ET
-    try:
-        root = ET.fromstring(xml_str)
-        def _parse_node(node):
-            tag = node.tag
-            if tag == 'map':
-                res = {}
-                key = None
-                for child in node:
-                    if child.tag == 'key':
-                        key = child.text
-                    else:
-                        res[key] = _parse_node(child)
-                return res
-            elif tag == 'array':
-                return [_parse_node(child) for child in node]
-            elif tag == 'string':
-                return node.text or ""
-            elif tag == 'integer':
-                return int(node.text or 0)
-            elif tag == 'boolean':
-                return (node.text or "0") == "1" or (node.text or "").lower() == "true"
-            elif tag == 'llsd':
-                return _parse_node(node[0]) if len(node) > 0 else {}
-            return node.text
-            
-        return _parse_node(root)
-    except Exception as e:
-#         print(f"LLSD XML Parse Error: {e}")
-        return None
-
-def render_llsd_xml(data):
-    """Simple LLSD XML renderer for arrays of strings or maps."""
-    if isinstance(data, list):
-        items = "".join([f"<string>{s}</string>" for s in data])
-        return f"<llsd><array>{items}</array></llsd>"
-    elif isinstance(data, dict):
-        items = "".join([f"<key>{k}</key><string>{v}</string>" for k, v in data.items()])
-        return f"<llsd><map>{items}</map></llsd>"
-    return ""
-
-    # RegionClient.teleport_to_region now implemented above
-
-# ==========================================
-# SECTION 7: MAIN APPLICATION (SLviewer.py)
-# ==========================================
-
-def safe_decode_llvariable(ll_var):
-    """
-    Safely decode a Variable LL packet field.
-    
-    The 'll_var' object passed here is an instance of the 'variable' class, 
-    which already has the length prefix stripped during packet loading. 
-    Its 'data' attribute holds the raw string bytes (including the trailing \x00).
-    """
-    if hasattr(ll_var, 'data') and isinstance(ll_var.data, bytes):
-        try:
-            # FIX: Use the 'data' attribute directly for the raw bytes, and strip the null terminator
-            return ll_var.data.decode('utf-8').rstrip('\x00')
-        except:
-            return str(ll_var.data)
-    # If the object is passed as a string/simple type, return it as a string
-    return str(ll_var)
-
-# --- Core Second Life Agent Class ---
-class SecondLifeAgent:
-    """Manages the connection and interaction with the Second Life grid."""
-    def __init__(self, ui_callback, debug_callback=None):
-        self.client = None 
-        self.ui_callback = ui_callback 
-        self.debug_callback = debug_callback
-        self.running = False
-        self.event_thread = None
-        self.current_region_name = ""
-        self.current_position = ""
-        
-        # NEW: Display Name Caching
-        self.display_name_cache = {} # UUID -> DisplayName
-        self.fetching_names = set() # Set of UUIDs currently being fetched
-        
-        # Connection credentials
-        self.agent_id = None
-        self.session_id = None
-        self.circuit_code = None
-        self.sim_ip = None
-        self.sim_port = None
-        self.raw_socket = None
-        self.first_name = "" 
-        self.connection_start_time = 0 
-        self.login_step = 0
-
-        # NEW: Movement Control State
-        self.key_states = {
-            'Up': const.AGENT_CONTROL_AT_POS,
-            'Down': const.AGENT_CONTROL_AT_NEG,
-            'Left': const.AGENT_CONTROL_LEFT_POS,
-            'Right': const.AGENT_CONTROL_RIGHT_POS,
-            'e': const.AGENT_CONTROL_UP_POS,
-            'c': const.AGENT_CONTROL_UP_NEG,
-            'space': const.AGENT_CONTROL_JUMP
-        }
-        self.is_key_down = {}
-        self.is_flying = False
-
-
-    def log(self, message):
-        """Helper to send logs to the UI thread."""
-        if self.debug_callback:
-            # We strip "DEBUG: " since the log handler adds its own formatting.
-            if message.startswith("DEBUG: "):
-                 message = message[7:]
-            
-            # --- MAP FETCH LOG HANDLER ---
-            if message.startswith("MAP_FETCH_TRIGGER"):
-                # Handle map fetch request triggered by RegionClient
-                _, region_name = message.split(", ", 1)
-                self.ui_callback("map_fetch_request", region_name.strip())
-
-            # --- DEBUG NOTIFICATION HANDLER ---
-            elif message.startswith("[NOTIFICATION]"):
-                 # Direct message to notification area
-                 clean_msg = message.replace("[NOTIFICATION]", "").strip()
-                 self.ui_callback("notification", clean_msg)
-
-            # --- FIX: New Handshake Complete Handler ---
-            if message.startswith("HANDSHAKE_COMPLETE"):
-                # We still update status/progress here for immediate feedback
-                _, region_name = message.split(", ", 1)
-                self.ui_callback("status", f"🟢 Successfully logged in to {region_name.strip()}!")
-                self.ui_callback("progress", ("RegionHandshake Received", 100))
-                
-                # FIX: Forward to debug_callback so ChatTab can trigger map fetch
-                if self.debug_callback:
-                    self.debug_callback(message)
-                    
-            # --- KICKED LOG HANDLER (NEW) ---
-            elif message.startswith("KICKED"):
-                _, reason = message.split(", ", 1)
-                self.ui_callback("status", f"🔴 Kicked: {reason.strip()}")
-                self.running = False # Stop the event loop upon kick
-                
-                # FIX: Forward to debug_callback so ChatTab can handle disconnect UI
-                if self.debug_callback:
-                    self.debug_callback(message)
-                
-            # --- CHAT ACK HANDLER ---
-            elif message.startswith("ACK_CONFIRMED:"):
-                _, seq_id = message.split(": ", 1)
-                self.ui_callback("chat_ack", int(seq_id.strip()))
-                
-            else:
-                # Filter out [SPY] messages from reaching the UI/console
-                if not message.startswith("[SPY]"):
-                    self.debug_callback(message)
-
-    # ... (rest of class) ...
-
-    # MODIFIED: Worker thread target for map image fetching - CLEANED
-    def _fetch_map_image_task(self, region_name):
-        try:
-            # Current grid coordinates
-            gx = self.client.grid_x
-            gy = self.client.grid_y
-            
-            # Use the proven URL format directly
-            url = f"https://map.secondlife.com/map-1-{gx}-{gy}-objects.jpg"
-            
-            # Proven headers
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
-            
-            # Proven SSL Context
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            
-            request = urllib.request.Request(url, headers=headers)
-            
-            with urllib.request.urlopen(request, timeout=15, context=ctx) as response:
-                if response.getcode() == 200:
-                    map_data = response.read()
-                    
-                    if len(map_data) > 2000:
-                        self.ui_callback("map_image_fetched", map_data)
-                    else:
-#                         print(f"Map data too small: {len(map_data)}")
-                        pass
-                else:
-#                     print(f"Map HTTP Error: {response.getcode()}")
-                    pass
-
-        except Exception as e:
-            # Catch ANY crash in the thread
-            error_msg = f"{type(e).__name__}: {e}"
-#             print(f"MAP THREAD CRASH: {error_msg}")
-            self.ui_callback("status", f"⚠️ Map Error: {error_msg}")
-            self.ui_callback("map_image_fetched", None)
-            
-    def fetch_map(self, region_name):
-        """Public entry point for fetching the map image."""
-        if not PIL_AVAILABLE:
-            self.ui_callback("chat", "--- Map Debug: PIL NOT INSTALLED/DETECTED ---")
-            self.ui_callback("map_image_fetched", None) 
-            return
-        
-        if not self.running:
-            return
-            
-        threading.Thread(target=self._fetch_map_image_task, args=(region_name,), daemon=True).start()
-
-    def _event_handler(self):
-        """Runs in a separate thread to constantly check for new grid events."""
-        self.log("Event handler thread started. Waiting for packets...")
-        
-        RESEND_INTERVAL = 1.0 # 1.0 second timeout for reliable packets
-        
-        while self.running and self.client:
-            
-            current_time = time.time()
-            
-            # --- Periodic Network Maintenance ---
-            # Send periodic AgentUpdates both DURING and AFTER handshake to stay active.
-            if current_time - self.client.last_update_send > 0.5:
-                # Pass the client's internal controls state
-                self.client.agentUpdate(controls=self.client.controls_once|self.client.controls, reliable=False) 
-                self.client.controls_once = 0
-                if not self.client.handshake_complete:
-                    self.log("Sending Handshake AgentUpdate...")
-                    self.ui_callback("progress", ("AgentUpdate", 75))
-
-            if not self.client.handshake_complete:
-                # Resend handshake packets if needed
-                if current_time - self.client.last_circuit_send > 1.0: 
-                    self.log("Resending UseCircuitCode...")
-                    self.ui_callback("progress", ("CircuitCode", 25))
-                    self.client.send_use_circuit_code()
-                    
-                if current_time - self.client.last_cam_send > 1.0: 
-                    self.log("Resending CompleteAgentMovement...")
-                    self.ui_callback("progress", ("CompleteAgentMovement", 50))
-                    self.client.send_complete_movement()
-            
-            # --- Resend Reliable Packets ---
-            if self.client.handshake_complete:
-                resend_list = []
-                # Use list(items()) to allow safe iteration while modifying the dictionary
-                for seq_id, (pck, last_send_time) in list(self.client.reliable_packets.items()):
-                    if current_time - last_send_time > RESEND_INTERVAL:
-                        resend_list.append(seq_id)
-                
-                for seq_id in resend_list:
-                    # Retrieve the original packet object
-                    if seq_id in self.client.reliable_packets:
-                        pck, _ = self.client.reliable_packets[seq_id]
-                        self.log(f"Resending reliable packet {seq_id} ({pck.body.name})...")
-                        
-                        # Use raw socket send with the original packet bytes
-                        # NOTE: We do NOT update the sequence number, only the resent flag needs setting
-                        pck.resent = True
-                        self.client.sock.sendto(bytes(pck), (self.client.host, self.client.port))
-                        pck.resent = False # Clear flag after sending
-                        
-                        # Update last_send_time for tracking
-                        self.client.reliable_packets[seq_id] = (pck, current_time) 
-            # --- End Resend Reliable Packets ---
-
-            # --- Performance Fix: Prune Reliable Packets ---
-            # Remove packets older than 60 seconds to prevent memory leaks/unbounded growth
-            # if the server stops ACking them.
-            if len(self.client.reliable_packets) > 0:
-                 # Check periodically (every 5 seconds roughly, based on iteration count or just random)
-                 if random.random() < 0.05: 
-                     cutoff = current_time - 60.0
-                     # Find expired keys
-                     expired = [sid for sid, (_, ts) in self.client.reliable_packets.items() if ts < cutoff]
-                     for sid in expired:
-                         del self.client.reliable_packets[sid]
-                         self.log(f"Pruned stale reliable packet {sid} (Older than 60s)")
-            # -----------------------------------------------
-
-
-            # --- Packet Receiving ---
-            packet = self.client.recv()
-
-            if packet:
-                packet_name = 'Unknown'
-                if hasattr(packet, 'body') and hasattr(packet.body, 'name'):
-                    packet_name = packet.body.name
-                
-                # Log incoming packet name (debug mode enabled)
-                self.log(f"RX Packet: {packet_name}")
-
-                # --- Handle Login/Handshake ---
-                if packet_name == "RegionHandshake":
-                    if hasattr(packet.body, 'RegionInfo'):
-                        # FIX: Use safe_decode_llvariable on SimName (Variable 1)
-                        self.current_region_name = safe_decode_llvariable(packet.body.RegionInfo.get('SimName', 'Connected Region'))
-                    self.current_position = "Landed"
-                    
-                    # The success message is now handled inside self.log via the HANDSHAKE_COMPLETE trigger
-                    self.log(f"HANDSHAKE_COMPLETE, {self.current_region_name}") # FIX: Trigger the UI update
-                    
-                    time.sleep(0.1) 
-                    # FIX: Send reliable CAM, it's already set to reliable=True in RegionClient.send_complete_movement()
-                    self.client.send_complete_movement() 
-                    
-                    time.sleep(0.1) 
-                    # NOTE: This AgentUpdate is now redundant as a RELIABLE one is sent in handleInternalPackets, 
-                    # but we keep it here to ensure quick non-reliable state assertion.
-                    self.client.agentUpdate(controls=self.client.controls_once|self.client.controls, reliable=False) 
-
-                # --- Handle Chat ---
-                elif packet_name == "ChatFromSimulator":
-                    chat_data = getattr(packet.body, 'ChatData', None)
-                    if chat_data:
-                        from_name = safe_decode_llvariable(chat_data.get('FromName', 'Unknown'))
-                        msg_text = safe_decode_llvariable(chat_data.get('Message', ''))
-                        # ChatType is U8
-                        chat_type = chat_data.get('ChatType', 0) 
-                        # SourceID is the UUID of the sender
-                        source_id = chat_data.get('SourceID', None)
-
-                        # 1. Filter typing indicators AND Prefetch Display Names
-                        # NOTE: We do this BEFORE filtering empty messages, as typing indicators often have empty bodies.
-                        if chat_type in (const.CHAT_START_TYPING, const.CHAT_STOP_TYPING):
-#                             print(f"DEBUG: Processed Typing Indicator: {chat_type} from {source_id}")
-                            pass
-                            if chat_type == const.CHAT_START_TYPING and source_id:
-                                # Prefetch the display name so it's ready when the message actually arrives
-                                if str(source_id) not in self.display_name_cache:
-#                                     print(f"DEBUG: Triggering Name Prefetch for {source_id}")
-                                    pass
-                                    self.log(f"Prefetching display name for typing user: {source_id}")
-                                    self.get_display_name(source_id, from_name)
-                                else:
-#                                     print(f"DEBUG: Name already cached for {source_id}")
-                                    pass
-                                    
-                            # Filter the message from the UI log
-                            # self.log(f"Filtered typing indicator (Type: {chat_type}) from {from_name}.")
-                            continue
-
-                        # 2. Filter empty messages
-                        if not msg_text:
-                            self.log(f"Filtered empty chat message from {from_name}.")
-                            continue
-                        
-                        # 3. Filter own messages (already displayed when ACK'd)
-                        if source_id and source_id == self.client.agent_id:
-                            self.log(f"Filtered own message echo from simulator.")
-                            continue
-                            
-                        # Fetch and use display name
-                        display_name = self.get_display_name(source_id, from_name)
-                        
-                        # FIX: Avoid printing the same name twice AND filter "Resident"
-                        clean_from_name = from_name.replace(" Resident", "")
-                        
-                        if display_name and display_name != from_name:
-                            name_label = f"{display_name} ({clean_from_name})"
-                        else:
-                            name_label = clean_from_name
-                            
-                        self.ui_callback("chat", (name_label, msg_text))
-                
-                # --- Handle Teleport Offer ---
-                elif packet_name == "TeleportOffer":
-                    offer = getattr(packet.body, 'Offer', {})
-                    if offer:
-                        # Extract necessary data
-                        teleport_id = offer.get("TeleportID")
-                        # FIX: Use safe_decode_llvariable on RegionName (Variable 1)
-                        region_name = safe_decode_llvariable(offer.get("RegionName", "Unknown Region"))
-                        l_cost = offer.get("L$Cost", 0)
-                        
-                        # Extract RegionHandle (U64) to get coordinates early (optional usage)
-                        region_handle = offer.get("RegionHandle", 0)
-
-                        # Send offer data to the UI thread
-
-                        self.ui_callback("teleport_offer", {
-                            "id": teleport_id,
-                            "region": region_name,
-                            "cost": l_cost
-                        })
-                
-                # --- General Connection Messages ---
-                elif packet_name == "TeleportFinish":
-                    # Update coordinates from the handle
-                    if hasattr(packet.body, 'Info'):
-                        handle = packet.body.Info.get("RegionHandle", 0)
-                        if handle:
-                            # Handle is a 64-bit int: y grid (in meters) << 32 | x grid (in meters)
-                            w_y = handle >> 32
-                            w_x = handle & 0xFFFFFFFF
-                            self.client.grid_x = w_x // 256
-                            self.client.grid_y = w_y // 256
-                            self.log(f"TeleportFinish: Updated grid coords to {self.client.grid_x}, {self.client.grid_y}")
-
-                    self.ui_callback("status", "🚀 Teleport finished! Starting handshake in new region...")
-                    # The network thread will now start the handshake process with the new region.
-                    # Clear handshake state to trigger new handshake process
-                    self.client.handshake_complete = False 
-                    self.client.last_circuit_send = 0
-                    self.client.circuit_packet = None
-                    self.client.cam_packet = None
-                    self.client.controls = 0
-                    self.client.controls_once = 0
-
-                elif packet_name == "CloseCircuit":
-                    self.ui_callback("status", "👋 Disconnected from the grid.")
-                    self.running = False
-                    break
-            
-            # Send periodic ACKs and AgentUpdates
-            if self.client and current_time - self.client.nextAck > 1.0:
-                self.client.sendAcks()
-                
-            # Continuous AgentUpdate for movement
-            if self.client and self.client.handshake_complete and current_time - self.client.last_update_send > 0.1: # 10Hz
-                self.client.agentUpdate(controls=self.client.controls_once|self.client.controls, reliable=False) 
-                self.client.controls_once = 0
-
-            time.sleep(0.005)
-
-    # --- Movement Control Methods (NEW) ---
-    def process_control_change(self, key, is_press):
-        """Updates the control flags based on key state."""
-        
-        # Handle Toggle (Fly)
-        if key == 'f' and is_press:
-            # Toggle the fly flag only on key down
-            self.is_flying = not self.is_flying
-            self.log(f"Fly mode toggled: {self.is_flying}")
-            # Ensure the state reflects the new mode
-            self.update_controls(toggle_fly=True) 
-            return
-
-        # Handle Continuous Controls (Arrow Keys, Jump, Up/Down)
-        if key in self.key_states:
-            control_flag = self.key_states[key]
-            
-            # Use self.is_key_down for debouncing and state tracking
-            if is_press and key not in self.is_key_down:
-                self.is_key_down[key] = True
-                self.update_controls(add_flags=control_flag)
-                
-            elif not is_press and key in self.is_key_down:
-                del self.is_key_down[key]
-                self.update_controls(remove_flags=control_flag)
-                
-    def update_controls(self, add_flags=0, remove_flags=0, toggle_fly=False):
-        """Calculates the new ControlFlags and updates the client."""
-        if not self.client: return
-        
-        current_flags = self.client.controls
-        
-        # 1. Apply Add/Remove for continuous controls (Arrow Keys, E, C, Space)
-        current_flags |= add_flags    # Set the flags for pressed keys
-        current_flags &= ~remove_flags # Clear the flags for released keys
-        
-        # 2. Apply Fly toggle
-        if toggle_fly:
-            current_flags ^= const.AGENT_CONTROL_FLY # Flip the fly bit
-            self.is_flying = bool(current_flags & const.AGENT_CONTROL_FLY)
-        elif self.is_flying:
-            current_flags |= const.AGENT_CONTROL_FLY # Ensure fly is set if state says so
-        else:
-            current_flags &= ~const.AGENT_CONTROL_FLY # Ensure fly is clear if state says so
-
-        # 3. Only send the jump flag once (or for one AgentUpdate cycle)
-        # We handle this by separating temporary flags (like Jump) into controls_once.
-        if add_flags & const.AGENT_CONTROL_JUMP:
-            self.client.controls_once |= const.AGENT_CONTROL_JUMP
-            
-        # 4. Update the main control flags (minus the jump flag, which is momentary)
-        self.client.controls = current_flags & ~const.AGENT_CONTROL_JUMP # JUMP is momentary
-        
-        # Force an AgentUpdate immediately to avoid lag
-        self.client.agentUpdate(controls=self.client.controls_once|self.client.controls, reliable=False)
-        self.client.controls_once = 0
-
-
-    # --- Packet Sending Wrappers ---
-    def get_socket(self):
-        if self.client: return self.client.sock
-        return None
-
-    def send_raw_packet(self, packet_obj):
-        # This is now only used for resending tracked reliable packets
-        if self.client:
-            return self.client.send(packet_obj)
-        return False
-    
-    def send_complete_movement_raw(self):
-        self.log("Building CompleteAgentMovement packet...")
-        msg = getMessageByName("CompleteAgentMovement")
-        msg.AgentData["AgentID"] = self.agent_id
-        msg.AgentData["SessionID"] = self.session_id
-        msg.AgentData["CircuitCode"] = self.circuit_code
-        # FIX: Ensure it is sent as reliable
-        pck = Packet(sequence=self.client.seq, message=msg, reliable=True, ack=False)
-        self.send_raw_packet(pck)
-
-
-    def send_chat_raw(self, message, channel=0, chat_type=1): 
-        self.log(f"Sending Chat: '{message[:15]}...' (Type: {chat_type}, Channel: {channel})")
-        
-        msg = getMessageByName("ChatFromViewer")
-        # FIX: Use client's agent_id and session_id to ensure consistency with the active UDP connection
-        msg.AgentData["AgentID"] = self.client.agent_id
-        msg.AgentData["SessionID"] = self.client.session_id
-        
-        # --- CHAT FIX: Variable Type 2, UTF-8, WITH AUTOMATIC NULL TERMINATION ---
-        # Passing the string with add_null=True to match standard SL chat packet expectations.
-        msg.ChatData["Message"] = variable(2, message, add_null=True) 
-        
-        msg.ChatData["Type"] = chat_type
-        msg.ChatData["Channel"] = channel
-        
-        # Use reliable=True for chat so we can track receipt via ACK
-        return self.client.send(msg, reliable=True)
-    
-    def send_chat(self, message):
-        """Public method for the UI to send chat messages."""
-        if self.client and self.running:
-            # chat_type 1 is CHAT_NORMAL (local chat)
-            return self.send_chat_raw(message, chat_type=const.CHAT_NORMAL)
-        return False
-    
-    def accept_teleport_offer(self, teleport_id, cost=0):
-        """Sends the TeleportAccept packet."""
-        self.log(f"Accepting teleport offer ID {teleport_id}...")
-        self.ui_callback("status", "Sending TeleportAccept. Stand by for jump...")
-        return self.client.send_teleport_accept(teleport_id, cost, license=True)
-
-    def get_display_name(self, source_id, fallback_name):
-        """Returns the display name if cached, otherwise starts a fetch and returns fallback."""
-        if not source_id: return fallback_name
-        
-        uuid_str = str(source_id)
-        if uuid_str in self.display_name_cache:
-            return self.display_name_cache[uuid_str]
-            
-
-            
-        # --- Performance Fix: Limit Cache Size ---
-        if len(self.display_name_cache) > 2000:
-            # Clear half the cache if it gets too big (simplest LRU approximation without using OrderedDict)
-            # Python 3.7+ dicts preserve insertion order, so this removes the oldest 1000 items.
-            self.log("Pruning display name cache...")
-            keys_to_remove = list(self.display_name_cache.keys())[:1000]
-            for k in keys_to_remove:
-                del self.display_name_cache[k]
-        # -----------------------------------------
-
-        if uuid_str not in self.fetching_names:
-            self.fetching_names.add(uuid_str)
-
-            threading.Thread(target=self._fetch_display_names_task, args=([uuid_str],), daemon=True).start()
-            
-        return fallback_name
-
-    def _fetch_display_names_task(self, uuids):
-        """Background task to fetch display names."""
-        if not self.client: return
-        
-        try:
-            # 1. Ensure we have the AvatarsDisplayName capability
-            if "AvatarsDisplayName" not in self.client.capabilities and "GetDisplayNames" not in self.client.capabilities:
-                # Add PeopleAPI and GetDisplayNames as fallbacks
-                self.client.fetch_capabilities(["AvatarsDisplayName", "GetDisplayNames", "EventQueueGet", "PeopleAPI"])
-                
-            cap_url = self.client.capabilities.get("AvatarsDisplayName") or self.client.capabilities.get("GetDisplayNames")
-            if not cap_url:
-                self.log("AvatarsDisplayName capability not available.")
-
-                return
-                
-            # 2. Request display names
-            query_url = f"{cap_url}?ids=" + "&ids=".join(uuids)
-            msg = f"Fetching display names from: {query_url}"
-            self.log(msg)
-            
-            headers = {
-                'User-Agent': SL_USER_AGENT,
-                'Accept': '*/*', # Try to be maximally permissive
-                'X-SecondLife-Agent-ID': str(self.agent_id),
-                'X-SecondLife-Session-ID': str(self.session_id)
-            }
-            
-            req = urllib.request.Request(query_url, headers=headers)
-            
-            try:
-                with urllib.request.urlopen(req, timeout=10) as response:
-                    if response.getcode() == 200:
-                        resp_data = response.read().decode('utf-8')
-                        self.log(f"Raw display name response: {resp_data}")
-
-                        
-                        if resp_data.strip().startswith('<'):
-                            data = parse_llsd_xml(resp_data)
-                        else:
-                            data = json.loads(resp_data)
-                            
-                        # Parse standard Display Name response
-                        if isinstance(data, dict):
-                            if 'agents' in data:
-                                for agent in data['agents']:
-                                    uid = agent.get('id')
-                                    dname = agent.get('display_name')
-                                    if uid and dname:
-                                        self.display_name_cache[uid] = dname
-                                        self.ui_callback("update_display_name", (uid, dname))
-                            elif 'bad_ids' in data and len(data) == 1:
-                                self.log(f"Display name fetch returned bad_ids: {data['bad_ids']}")
-                            else:
-                                self.log(f"Unexpected display name response format: {list(data.keys())}")
-                                # CHECK: If we got back a capability list ( Metadata / EventQueueGet ), Try POST!
-                                if 'Metadata' in data or 'EventQueueGet' in data:
-                                    self.log("GET returned capability list? Retrying with POST...")
-
-                                    
-                                    # Prepare POST payload
-                                    payload = render_llsd_xml({'ids': [str(u) for u in uuids]}).encode('utf-8')
-                                    req_post = urllib.request.Request(query_url.split('?')[0], data=payload, headers={
-                                        'User-Agent': SL_USER_AGENT,
-                                        'Content-Type': 'application/llsd+xml',
-                                        'Accept': 'application/llsd+xml',
-                                        'X-SecondLife-Agent-ID': str(self.agent_id),
-                                        'X-SecondLife-Session-ID': str(self.session_id)
-                                    })
-                                    
-                                    with urllib.request.urlopen(req_post, timeout=10) as response_post:
-                                        if response_post.getcode() == 200:
-                                            resp_data_post = response_post.read().decode('utf-8')
-
-                                            if resp_data_post.strip().startswith('<'):
-                                                data_post = parse_llsd_xml(resp_data_post)
-                                            else:
-                                                data_post = json.loads(resp_data_post)
-                                            
-                                            if isinstance(data_post, dict) and 'agents' in data_post:
-                                                for agent in data_post['agents']:
-                                                    uid = agent.get('id')
-                                                    dname = agent.get('display_name')
-                                                    if uid and dname:
-                                                        self.display_name_cache[uid] = dname
-                                                        self.ui_callback("update_display_name", (uid, dname))
-            except urllib.error.HTTPError as e:
-                self.log(f"HTTP Error fetching display names: {e.code} {e.reason}")
-
-                # Try reading error body
-                try:
-                    err_body = e.read().decode('utf-8')
-                except: pass
-                        
-        except Exception as e:
-            err = f"Error fetching display names: {e}"
-            self.log(err)
-#            print(f"ERROR: {err}")
-        finally:
-            for uid in uuids:
-                if uid in self.fetching_names:
-                    self.fetching_names.remove(uid)
-
-    # MODIFIED: Fix implemented here to ensure MapNameRequest is reliable
-    def teleport(self, region_name):
-        self.ui_callback("status", f"Requesting teleport to {region_name}...")
-        if self.client and self.running:
-            # FIX: Execute the blocking lookup logic in a worker thread
-            teleport_thread = threading.Thread(target=self._teleport_lookup_task, args=(region_name,), daemon=True)
-            teleport_thread.start()
-            
-    # MODIFIED: Worker thread target for map image fetching with new robust fallbacks
-    def _fetch_map_image_task(self, region_name):
-        # 1. Prepare region name for URL (underscores for spaces)
-        # Use simple unquoted version for the tile name part
-        region_name_url = urllib.parse.quote(region_name.strip().replace(' ', '_')) 
-        
-        # *** NEW: Removed small delay for map server processing to speed up load ***
-        # time.sleep(2.0)
-        
-        # 2. Define multiple URLs with fallback logic
-        # *** FIX: Using robust coordinate-based URLs as primary ***
-        
-        # Current grid coordinates
-        gx = self.client.grid_x
-        gy = self.client.grid_y
-        
-        # FIX: If coords are missing (fresh login), try to resolve them via gridsurvey
-        if gx == 0 and gy == 0:
-             self.ui_callback("status", f"📍 Resolving coordinates for {region_name}...")
-             self.log(f"Map fetch: Coords are 0,0. Attempting gridsurvey lookup for '{region_name}'...")
-             
-             info = self._gridsurvey_region_lookup(region_name)
-             if info:
-                 gx = int(info['X'])
-                 gy = int(info['Y'])
-                 # Update client state for future use
-                 self.client.grid_x = gx
-                 self.client.grid_y = gy
-                 self.log(f"Map fetch: Resolved coords to {gx}, {gy}")
-             else:
-                 self.log(f"Map fetch: Gridsurvey lookup failed. Will attempt fallback URLs.")
-        
-        urls_to_try = [
-            # Primary: Standard coordinate-based format (Zoom level 1) - FORCE HTTPS
-            # https://map.secondlife.com/map-1-{x}-{y}-objects.jpg
-            f"https://map.secondlife.com/map-1-{gx}-{gy}-objects.jpg",
-            
-            # Fallback 0: HTTP version (in case of SSL issues)
-            f"http://map.secondlife.com/map-1-{gx}-{gy}-objects.jpg",
-            
-            # Fallback 1: Robust coordinate-based format 
-            f"https://map.secondlife.com/map/secondlife/{region_name_url}/128/128/1000/256x256.jpg", 
-            # Fallback 2: Simplified URL on map domain (often redirects to the primary)
-            f"https://map.secondlife.com/map/secondlife/{region_name_url}.jpg",
-            # Fallback 3: Older world domain simplified format (as a last resort)
-            f"https://world.secondlife.com/map/secondlife/{region_name_url}.jpg" 
-        ]
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-
-        last_error = ""
-
-        for i, map_url in enumerate(urls_to_try):
-            try:
-                request = urllib.request.Request(map_url, headers=headers)
-                
-                with urllib.request.urlopen(request, timeout=7) as response:
-                    # Check if the response code indicates success
-                    if response.getcode() == 200:
-                        map_data = response.read()
-                        # A valid map image should be significantly larger than a few bytes
-                        # Error images or small placeholders are often < 2KB
-                        if len(map_data) > 2000: 
-                            self.ui_callback("status", f"Map loaded for {region_name}.")
-                            self.ui_callback("map_image_fetched", map_data)
-                            return # Success!
-                        else:
-                            msg = f"Map fetch size too small ({len(map_data)} bytes) from {map_url}"
-                            last_error = msg
-                            # Continue to next URL
-                    else:
-                        msg = f"HTTP {response.getcode()} from {map_url}"
-                        last_error = msg
-                        # Continue to next URL
-
-            except urllib.error.HTTPError as e:
-                # *** MODIFIED LOGGING: Log specific HTTP error ***
-                error_msg = f"HTTP Error {e.code} fetching map image from {map_url}: {e.reason}"
-                last_error = f"HTTP {e.code}"
-                # Continue to next URL
-            except Exception as e:
-                # *** MODIFIED LOGGING: Log general network errors ***
-                error_msg = f"General Error fetching map image from {map_url}: {type(e).__name__}: {e}"
-                last_error = str(e)
-                # Continue to next URL
-        
-        # 3. If all attempts fail
-        self.ui_callback("status", f"⚠️ Map unavailable. ({last_error})")
-        self.ui_callback("map_image_fetched", None)
-            
-    def fetch_map(self, region_name):
-        """Public entry point for fetching the map image."""
-        if not self.running or not PIL_AVAILABLE: # *** FIX: Check if PIL is available before trying to fetch/process ***
-            self.log("PIL/Pillow not available, skipping map fetch.")
-            self.ui_callback("map_image_fetched", None) # Send None to trigger placeholder
-            return
-            
-        threading.Thread(target=self._fetch_map_image_task, args=(region_name,), daemon=True).start()
-    
-    # NEW: GridSurvey API-based region lookup (doesn't require handshake)
-    def _gridsurvey_region_lookup(self, region_name=None, grid_x=None, grid_y=None):
-        """Look up region handle using the gridsurvey.com API.
-        
-        Can look up by name OR by grid coordinates (x, y).
-        
-        Args:
-            region_name: Name of the region to look up (optional)
-            grid_x: Grid X coordinate (optional)
-            grid_y: Grid Y coordinate (optional)
-            
-        Returns:
-            dict with 'Handle', 'X', 'Y', 'Name' keys, or None if lookup failed
-        """
-        if region_name:
-            encoded_name = urllib.parse.quote(region_name.strip())
-            url = f"http://api.gridsurvey.com/simquery.php?region={encoded_name}"
-        elif grid_x is not None and grid_y is not None:
-            # FIX: Correct parameter is 'xy' and we request just the name
-            url = f"http://api.gridsurvey.com/simquery.php?xy={grid_x},{grid_y}&item=name"
-        else:
-            self.log("[GridSurvey] Error: Must provide either region_name or grid coordinates.")
-            return None
-        
-        try:
-            self.log(f"[GridSurvey] Looking up '{region_name}' at {url}")
-            headers = {
-                'User-Agent': 'BlackGlass SL Client/1.0 (gridsurvey lookup)'
-            }
-            request = urllib.request.Request(url, headers=headers)
-            
-            with urllib.request.urlopen(request, timeout=7) as response:
-                if response.getcode() == 200:
-                    data = response.read().decode('utf-8')
-                    self.log(f"[GridSurvey] Response received: {len(data)} bytes")
-                    
-                    # --- Special handling for coordinate lookup (item=name) ---
-                    if grid_x is not None and 'item=name' in url:
-                        name_result = data.strip()
-                        if "Error" not in name_result:
-                            self.log(f"[GridSurvey] Found region name by coords: {name_result}")
-                            # We construct a synthetic result since we already know X/Y
-                            # Calculate handle
-                            x_meters = int(grid_x) * 256
-                            y_meters = int(grid_y) * 256
-                            handle = (y_meters << 32) | x_meters
-                            return {
-                                'Handle': handle,
-                                'X': int(grid_x),
-                                'Y': int(grid_y),
-                                'Name': name_result
-                            }
-                        else:
-                            self.log(f"[GridSurvey] API Error: {name_result}")
-                            return None
-                    # -----------------------------------------------------------
-
-                    # Parse key-value pairs (format: "key value\n" - space-separated) for standard region lookup
-                    result = {}
-                    for line in data.strip().split('\n'):
-                        # Support both space-separated and equals-separated formats
-                        if '=' in line:
-                            key, value = line.split('=', 1)
-                            result[key.strip()] = value.strip()
-                        elif ' ' in line and not line.startswith('Error'):
-                            parts = line.split(' ', 1)
-                            if len(parts) == 2:
-                                result[parts[0].strip()] = parts[1].strip()
-                    
-                    # Check if region was found - gridsurvey returns x/y coordinates, not simhandle
-                    if 'x' in result and 'y' in result:
-                        try:
-                            grid_x = int(result['x'])
-                            grid_y = int(result['y'])
-                            
-                            # Check if region has valid coordinates (not 0,0 which means not found)
-                            if grid_x == 0 and grid_y == 0:
-                                self.log(f"[GridSurvey] Region '{region_name}' not found (coords=0,0)")
-                                return None
-                            
-                            # Calculate region handle from grid coordinates
-                            # Handle format: (y_meters << 32) | x_meters
-                            # Grid coordinates are in 256m tiles, so multiply by 256 to get meters
-                            x_meters = grid_x * 256
-                            y_meters = grid_y * 256
-                            handle = (y_meters << 32) | x_meters
-                            
-                            self.log(f"[GridSurvey] Found region: grid=({grid_x}, {grid_y}), handle={handle}")
-                            
-                            return {
-                                'Handle': handle,
-                                'X': grid_x,
-                                'Y': grid_y,
-                                'Name': result.get('name', region_name)
-                            }
-                        except (ValueError, KeyError) as e:
-                            self.log(f"[GridSurvey] Invalid coordinate format: x={result.get('x')}, y={result.get('y')} - {e}")
-                            return None
-                    else:
-                        self.log(f"[GridSurvey] No 'x' or 'y' fields in response. Keys: {list(result.keys())}")
-                        return None
-                else:
-                    self.log(f"[GridSurvey] HTTP {response.getcode()} from API")
-                    return None
-                    
-        except urllib.error.HTTPError as e:
-            self.log(f"[GridSurvey] HTTP Error {e.code}: {e.reason}")
-            return None
-        except Exception as e:
-            self.log(f"[GridSurvey] Lookup error: {type(e).__name__}: {e}")
-            return None
-            
-    # NEW: Worker thread target for teleport lookup/request
-    def _teleport_lookup_task(self, region_name):
-        """Handles the blocking map lookup and subsequent teleport request with retries.
-        
-        Uses gridsurvey API as a fallback when RegionHandshake is incomplete or
-        MapNameRequest fails.
-        """
-        
-        # NOTE: Teleporting to 'home' or 'last' is handled by the initial login server call
-        # which is outside of this in-world mechanism.
-        if region_name.lower() in ("home", "last"):
-            self.log(f"Cannot use in-world teleport for special regions: '{region_name}'.")
-            self.ui_callback("status", f"❌ Teleport failed: '{region_name}' requires relogging/login-server call.")
-            return
-
-        # --- Decision Point: Choose lookup method based on handshake status ---
-        
-        result_block = None
-        
-        # STRATEGY 1: If handshake is NOT complete, use gridsurvey API directly
-        if not self.client.handshake_complete:
-            self.log(f"RegionHandshake incomplete. Using gridsurvey API for '{region_name}'...")
-            self.ui_callback("status", f"🔍 Looking up {region_name} via gridsurvey (handshake incomplete)...")
-            result_block = self._gridsurvey_region_lookup(region_name)
-            
-            if result_block:
-                self.log(f"GridSurvey lookup succeeded for '{region_name}'")
-            else:
-                self.log(f"GridSurvey lookup failed for '{region_name}'")
-                self.ui_callback("status", f"❌ Teleport failed: Region '{region_name}' not found via gridsurvey.")
-                return
-        
-        # STRATEGY 2: If handshake IS complete, try MapNameRequest first, then fallback to gridsurvey
-        else:
-            self.log(f"RegionHandshake complete. Trying MapNameRequest for '{region_name}'...")
-            self.ui_callback("status", f"🔍 Looking up {region_name}...")
-            
-            # --- Region Lookup with Retry Logic (MapNameRequest) ---
-            
-            target_name_lower = region_name.lower()
-            
-            # 1. Initialize state
-            with self.client.teleport_lookup_lock:
-                self.client.teleport_lookup_target_name = target_name_lower
-                self.client.teleport_lookup_result = None
-                self.client.teleport_lookup_event.clear() # Ensure the event is clear
-                
-            max_attempts = 3
-            wait_per_attempt = 3.0 # Increase wait time for network latency
-
-            for attempt in range(max_attempts):
-                
-                # Send MapNameRequest
-                self.log(f"Sending MapNameRequest (Attempt {attempt+1}/{max_attempts}) for '{region_name}'...")
-                
-                msg_request = getMessageByName("MapNameRequest")
-                msg_request.AgentData["AgentID"] = self.agent_id
-                msg_request.AgentData["SessionID"] = self.session_id
-                
-                # FIX: The 'variable' class handles null-termination automatically from the string
-                
-                if len(region_name) + 1 > 255: 
-                     self.log(f"Region name '{region_name}' is too long.")
-                     self.ui_callback("status", f"❌ Teleport failed: Region name too long.")
-                     return
-                     
-                # FIX: Ensure the Variable field is set with the correctly encoded bytes and type 1
-                # Pass the raw string, the variable class handles encoding.
-                # Standard region names in map lookup are null-terminated.
-                msg_request.RequestData["Name"] = variable(1, region_name, add_null=True) 
-                msg_request.RequestData["Flags"] = 0 
-                
-                # Send the request
-                # *** FIX: MapNameRequest MUST be sent as a reliable packet ***
-                self.client.send(msg_request, reliable=True)
-                
-                # 2. Wait for MapItemReply (blocking the worker thread)
-                if self.client.teleport_lookup_event.wait(wait_per_attempt):
-                    # Event was set, reply was received by the network thread
-                    self.log(f"Region lookup received reply on attempt {attempt+1}.")
-                    break
-                else:
-                    self.log(f"Region lookup timed out on attempt {attempt+1}. Retrying...")
-                    # Loop continues for next attempt
-
-            # --- Process MapNameRequest Result ---
-            
-            # Extract result block safely
-            with self.client.teleport_lookup_lock:
-                result_block = self.client.teleport_lookup_result
-                self.client.teleport_lookup_target_name = None # Clear state
-                self.client.teleport_lookup_result = None 
-                self.client.teleport_lookup_event.clear() # Clear event one final time
-
-            # If MapNameRequest failed, try gridsurvey as fallback
-            if result_block is None:
-                self.log(f"MapNameRequest failed after {max_attempts} attempts. Trying gridsurvey API...")
-                self.ui_callback("status", f"🔄 Retrying lookup via gridsurvey...")
-                result_block = self._gridsurvey_region_lookup(region_name)
-                
-                if result_block:
-                    self.log(f"GridSurvey fallback succeeded for '{region_name}'")
-                else:
-                    self.log(f"GridSurvey fallback also failed for '{region_name}'")
-                    self.ui_callback("status", f"❌ Teleport failed: Region '{region_name}' not found (tried both methods).")
-                    return
-
-        # --- Send Teleport Request (Common Path) ---
-        
-        # At this point, result_block should contain valid region data
-        region_handle = result_block["Handle"]
-        
-        # Update our client's expected destination coordinates immediately
-        # (Handle is y << 32 | x)
-        w_y = region_handle >> 32
-        w_x = region_handle & 0xFFFFFFFF
-        self.client.grid_x = w_x // 256
-        self.client.grid_y = w_y // 256
-        
-        self.log(f"Region lookup success: Handle={region_handle}, Sim Tile X={result_block['X']}, Y={result_block['Y']}")
-        
-        # Default position in the region: Center (128, 128) at height 30.0
-        position = vector3(128.0, 128.0, 30.0) 
-
-        self.client.teleport_to_region(region_name, region_handle, position)
-        self.ui_callback("status", f"🚀 Teleport request sent for {region_name}. Waiting for confirmation...")
-
-    def hard_teleport(self, region_name, x=128, y=128, z=30):
-        """
-        Performs a 'hard teleport' by logging out and immediately logging back in 
-        at the target region and coordinates.
-        """
-        self.log(f"Initiating Hard Teleport to '{region_name}' at <{x}, {y}, {z}>...")
-        self.ui_callback("status", f"🔄 Relogging to {region_name} ({x}, {y})...")
-        
-        # 1. Format the start URI
-        # Format: uri:Region%20Name&x&y&z
-        encoded_region_name = urllib.parse.quote(region_name.strip())
-        start_uri = f"uri:{encoded_region_name}&{int(x)}&{int(y)}&{int(z)}"
-        
-        # --- FIX: Clear the minimap only if changing regions ---
-        # If we are just relogging in the same region, keep the map for context.
-        if self.current_region_name and region_name.lower().strip() != self.current_region_name.lower().strip():
-             self.ui_callback("clear_map", None)
-        # ------------------------------------------
-        
-        # 2. Stop the current connection
-        self.stop()
-        
-        # 3. Wait a moment for socket cleanup
-        time.sleep(2.0)
-        
-        # 4. Start a new login sequence in a new thread to avoid blocking the UI
-        # We need to call login() again. Since we stored credentials, we can reuse them.
-        
-        def relog_task():
-            try:
-                self.login(self.first_name, self.last_name, self.password, start_uri)
-            except Exception as e:
-                self.ui_callback("status", f"❌ Hard Teleport Failed: {e}")
-                
-        threading.Thread(target=relog_task, daemon=True).start()
-
-
-            
-    def stop(self):
-        self.log("Stopping client...")
-        self.running = False
-        if self.client:
-            try:
-                self.client.logout() 
-            except:
-                pass 
-        if self.event_thread and self.event_thread.is_alive():
-            try:
-                self.event_thread.join(1)
-            except: pass
-
-    def login(self, first, last, password, region_name):
-        self.ui_callback("status", "🌐 Connecting to the Second Life Grid (HTTP)...")
-        self.ui_callback("progress", ("Initial Connection", 5))
-        self.log(f"Starting login process for {first} {last} @ {region_name}")
-        
-        try:
-            self.log("Requesting XML-RPC login token...")
-            # The 'start' parameter is what determines the landing spot
-            login_token = login_to_simulator(first, last, password, start=region_name)
-
-            if login_token.get("login") != "true":
-                 message = login_token.get("message", "Unknown login error")
-                 self.log(f"Login failed. Server response: {message}")
-                 raise ConnectionError(message)
-            
-            self.log("HTTP Login successful! Token received.")
-            self.ui_callback("progress", ("HTTP Login Success", 10))
-            
-            # Diagnostic: Log all keys and if 'capabilities' is present
-#             print(f"DEBUG: Login Token Keys: {list(login_token.keys())}")
-            if 'capabilities' in login_token:
-#                 print(f"DEBUG: Capabilities in Login Token: {list(login_token['capabilities'].keys())}")
-                pass
-            
-            self.circuit_code = int(login_token['circuit_code'])
-            self.agent_id = UUID(login_token['agent_id'])
-            self.session_id = UUID(login_token['session_id'])
-            self.sim_ip = login_token.get('sim_ip')
-            self.sim_port = int(login_token.get('sim_port'))
-            self.first_name = first 
-            self.last_name = last
-            self.password = password 
-
-            self.log("Initializing UDP Stream...")
-            # Always set debug=True in RegionClient so that it sends logs to SecondLifeAgent.log
-            # The agent itself will decide whether to pass them to the UI based on debug_callback.
-            self.client = RegionClient(login_token, debug=True, log_callback=self.log) 
-            self.raw_socket = self.get_socket()
-            self.log(f"Socket acquisition status: {'Success' if self.raw_socket else 'Failed'}")
-
-            self.connection_start_time = time.time()
-            self.running = True
-            self.event_thread = threading.Thread(target=self._event_handler, daemon=True)
-            self.event_thread.start()
-            
-            # --- FIX: Set the initial status to reflect the UDP handshake phase ---
-            self.ui_callback("status", "Teleport complete.")
-            
-            # --- NEW: Optimistic Map Fetch ---
-            # If we know the region name from the start URI, fetch the map immediately
-            if region_name.startswith("uri:"):
-                try:
-                    # Format: uri:Region%20Name&128&128&30
-                    parts = region_name[4:].split('&')
-                    encoded_name = parts[0]
-                    decoded_name = urllib.parse.unquote(encoded_name)
-                    self.current_region_name = decoded_name # FIX: Store resolved name
-                    self.fetch_map(decoded_name)
-                except:
-                    pass
-            # --- END NEW ---
-            
-            # --- FALLBACK: Resolve region name from coordinates if not found in URI ---
-            if not self.current_region_name:
-                 # We should have coordinates from the login token (via RegionClient)
-                 gx = self.client.grid_x
-                 gy = self.client.grid_y
-                 
-                 if gx and gy:
-                     self.ui_callback("status", f"📍 Resolving region name for coordinates {gx}, {gy}...")
-                     self.log(f"Login: Region name unknown. Attempting lookup for {gx}, {gy}...")
-                     
-                     # Perform blocking lookup (since we are in a thread)
-                     info = self._gridsurvey_region_lookup(grid_x=gx, grid_y=gy)
-                     
-                     if info and 'Name' in info:
-                         self.current_region_name = info['Name']
-                         self.log(f"Resolved region name: '{self.current_region_name}'")
-                         self.ui_callback("status", f"✅ Resolved region: {self.current_region_name}")
-                         
-                         # Also fetch map
-                         self.fetch_map(self.current_region_name)
-                     else:
-                         self.log("Region name lookup failed.")
-                         self.ui_callback("status", "⚠️ Could not resolve region name.")
-            # -------------------------------------------------------------------------
-            # --- END FIX ---
-            
-            return True
-                
-        except Exception as e:
-            # We don't call ui_callback("error", ...) here, we raise the error 
-            # and let the calling thread (login_task) handle the UI failure via its own callback.
-            raise ConnectionError(str(e))
-
-
-# ==========================================
-# SECTION 8: PERSISTENCE AND ENCRYPTION
-# ==========================================
-# Simple XOR Cipher for "encryption" as requested, using a constant key.
-# NOTE: This is NOT cryptographically secure and should not be used for real security.
-_SECRET_KEY = b"sl_chat_key_v1"
-CREDENTIALS_FILE = "sl_credentials.json"
-
-def _cipher_xor(data_bytes, key=_SECRET_KEY):
-    """Simple repeating-key XOR cipher."""
-    key_len = len(key)
-    return bytes(data_bytes[i] ^ key[i % key_len] for i in range(len(data_bytes)))
-
-def save_credentials(credentials):
-    """Saves a single credential entry to the JSON file, encrypting the password."""
-    try:
-        if os.path.exists(CREDENTIALS_FILE):
-            with open(CREDENTIALS_FILE, 'r') as f:
-                data = json.load(f)
-        else:
-            data = []
-            
-        full_name = f"{credentials['first']} {credentials['last']}"
-        existing_names = [f"{c['first']} {c['last']}" for c in data]
-
-        if full_name in existing_names:
-            index = existing_names.index(full_name)
-            data.pop(index) 
-        
-        password_bytes = credentials['password'].encode('utf-8')
-        encrypted_password = _cipher_xor(password_bytes)
-        
-        encoded_password = base64.b64encode(encrypted_password).decode('utf-8')
-        
-        new_entry = {
-            'first': credentials['first'],
-            'last': credentials['last'],
-            'password_enc': encoded_password,
-            'region': credentials['region']
-        }
-        data.append(new_entry)
-
-        with open(CREDENTIALS_FILE, 'w') as f:
-            json.dump(data, f, indent=4)
-            
-        return True
-    except Exception as e:
-#         print(f"Error saving credentials: {e}")
-        return False
-
-def load_credentials():
-    """Loads all credentials from the JSON file, decrypting passwords."""
-    if not os.path.exists(CREDENTIALS_FILE):
-        return []
-    
-    try:
-        with open(CREDENTIALS_FILE, 'r') as f:
-            data = json.load(f)
-            
-        decrypted_data = []
-        for entry in data:
-            try:
-                encoded_password = entry.get('password_enc', '')
-                if not encoded_password: continue
-                
-                encrypted_password = base64.b64decode(encoded_password)
-                password_bytes = _cipher_xor(encrypted_password)
-                password = password_bytes.decode('utf-8')
-                
-                decrypted_data.append({
-                    'first': entry['first'],
-                    'last': entry['last'],
-                    'password': password,
-                    'region': entry.get('region', 'last') 
-                })
-            except Exception as e:
-                print(f"Warning: Failed to decrypt credential entry. Skipping. Error: {e}")
-                continue
-                
-        return decrypted_data
-    except Exception as e:
-#         print(f"Error loading credentials (file corrupted?): {e}")
-        return []
-
-# ==========================================
-# SECTION 9: GUI IMPLEMENTATION (Multi-Client)
-# ==========================================
-
-# --- Custom Themed Dialogs (NEW) ---
-
-class ThemedDialog(Toplevel):
-    def __init__(self, parent, title=None, topmost=False):
-        super().__init__(parent)
-        self.transient(parent)
-        if title:
-            self.title(title)
-        
-        self.parent = parent
-        self.result = None
-        
-        # Set window properties to adhere to theme
-        self.configure(bg='#0A0A0A')
-        self.resizable(False, False)
-        if topmost:
-            self.attributes("-topmost", True)
-        self.protocol("WM_DELETE_WINDOW", self.cancel)
-        
-        self.body()
-        self.buttonbox()
-        
-        self.grab_set()
-        
-        # Center the dialog
-        parent_x = parent.winfo_rootx()
-        parent_y = parent.winfo_rooty()
-        parent_w = parent.winfo_width()
-        parent_h = parent.winfo_height()
-        
-        # Must update_idletasks before getting window size
-        self.update_idletasks()
-        
-        win_w = self.winfo_width()
-        win_h = self.winfo_height()
-        
-        x = parent_x + (parent_w - win_w) // 2
-        y = parent_y + (parent_h - win_h) // 2
-        
-        self.geometry(f'+{x}+{y}')
-        
-        self.initial_focus = self
-        if self.initial_focus:
-            self.initial_focus.focus_set()
-            
-        self.wait_window(self)
-
-    def body(self):
-        # Create dialog body. Override in subclasses.
-        pass
-
-    def buttonbox(self):
-        # Create buttons. Override in subclasses.
-        box = ttk.Frame(self, style='BlackGlass.TFrame')
-        box.pack(padx=10, pady=10)
-
-    def ok(self):
-        self.result = True
-        self.destroy()
-
-    def cancel(self):
-        self.result = False
-        self.destroy()
-
-class ThemedMessageBox(ThemedDialog):
-    """
-    Custom equivalent of messagebox.askyesno, showinfo, etc.
-    type_ is 'yesno', 'ok', 'error', 'warning'
-    """
-    def __init__(self, parent, title, message, type_='yesno', topmost=False):
-        self.message = message
-        self.type = type_
-        super().__init__(parent, title, topmost=topmost)
-
-    def body(self):
-        # Icon can be styled with text or an image if PIL was used, but sticking to text/color for now
-        icon_text = ""
-        icon_color = "#FFFFFF"
-        
-        if self.type == 'error':
-            icon_text = "❌"
-            icon_color = "#FF0000"
-        elif self.type == 'warning' or self.type == 'yesno':
-            icon_text = "⚠️"
-            icon_color = "#FFFF00"
-        elif self.type == 'info':
-            icon_text = "ℹ️"
-            icon_color = "#00FFFF"
-        
-        main_frame = ttk.Frame(self, style='BlackGlass.TFrame', padding=(15, 15, 15, 0))
-        main_frame.pack(fill='both', expand=True)
-
-        # Icon/Message frame
-        content_frame = ttk.Frame(main_frame, style='BlackGlass.TFrame')
-        content_frame.pack(fill='x', expand=True)
-        
-        ttk.Label(content_frame, text=icon_text, style='BlackGlass.TLabel', foreground=icon_color, font=('Helvetica', 20, 'bold')).pack(side=tk.LEFT, padx=(0, 10))
-        
-        # Use a Message widget for multi-line support
-        msg = tk.Message(content_frame, text=self.message, 
-                         bg='#0A0A0A', fg='#F0F0F0', 
-                         font=('Helvetica', 11), 
-                         justify=tk.LEFT)
-        msg.pack(side=tk.LEFT, fill='both', expand=True)
-
-    def buttonbox(self):
-        box = ttk.Frame(self, style='BlackGlass.TFrame', padding=(15, 0, 15, 15))
-        box.pack(fill='x')
-        
-        if self.type == 'yesno':
-            yes_button = ttk.Button(box, text="Yes", command=self.ok, style='BlackGlass.TButton', width=10)
-            yes_button.pack(side=tk.RIGHT, padx=5)
-            self.bind("<Return>", lambda e: self.ok())
-            
-            no_button = ttk.Button(box, text="No", command=self.cancel, style='BlackGlass.TButton', width=10)
-            no_button.pack(side=tk.RIGHT, padx=5)
-            self.bind("<Escape>", lambda e: self.cancel())
-        
-        elif self.type in ('ok', 'error', 'warning', 'info'):
-            ok_button = ttk.Button(box, text="OK", command=self.ok, style='BlackGlass.TButton', width=10)
-            ok_button.pack(side=tk.RIGHT)
-            self.bind("<Return>", lambda e: self.ok())
-            self.bind("<Escape>", lambda e: self.ok())
-            
-        self.initial_focus = yes_button if self.type == 'yesno' else ok_button
-
-class ThemedAskString(ThemedDialog):
-    """
-    Custom equivalent of simpledialog.askstring.
-    """
-    def __init__(self, parent, title, prompt):
-        self.prompt = prompt
-        self.value = None
-        super().__init__(parent, title)
-        
-    def body(self):
-        main_frame = ttk.Frame(self, style='BlackGlass.TFrame', padding=15)
-        main_frame.pack(fill='both', expand=True)
-        
-        ttk.Label(main_frame, text=self.prompt, style='BlackGlass.TLabel').pack(pady=(0, 5), anchor='w')
-        
-        self.entry = tk.Entry(main_frame, width=40, bg='#2C2C2C', fg='#FFFFFF', insertbackground='white', relief=tk.FLAT, highlightthickness=1, highlightbackground='#555555')
-        self.entry.pack(fill='x')
-        
-        self.initial_focus = self.entry
-
-    def buttonbox(self):
-        box = ttk.Frame(self, style='BlackGlass.TFrame', padding=(15, 0, 15, 15))
-        box.pack(fill='x')
-        
-        ok_button = ttk.Button(box, text="OK", command=self.ok, style='BlackGlass.TButton', width=10)
-        ok_button.pack(side=tk.RIGHT, padx=5)
-        self.bind("<Return>", lambda e: self.ok())
-        
-        cancel_button = ttk.Button(box, text="Cancel", command=self.cancel, style='BlackGlass.TButton', width=10)
-        cancel_button.pack(side=tk.RIGHT, padx=5)
-        self.bind("<Escape>", lambda e: self.cancel())
-
-    def ok(self):
-        self.value = self.entry.get().strip()
-        self.destroy()
-
-    # Public static methods for convenience
+class SmartParser:
+    """Parses SLurls, Region Names, and Coordinate strings."""
     @staticmethod
-    def askstring(parent, title, prompt):
-        d = ThemedAskString(parent, title, prompt)
-        return d.value if d.value else None
-
-# --- Minimap Widget ---
-class MinimapCanvas(tk.Canvas):
-    def __init__(self, master, agent, **kwargs):
-        # We remove explicit width/height here, as the wrapper manages the size.
-        # FIX: We restore explicit width=256, height=256 to prevent default Canvas sizing from expanding the column.
-        kwargs.setdefault('width', 256)
-        kwargs.setdefault('height', 256)
-        super().__init__(master, **kwargs)
-        self.agent = agent
-        self.configure(bg='#1C1C1C', highlightthickness=1, highlightbackground='#444444')
-        self.size = 256 # SL regions are 256x256 meters
-        self.source_image = None # NEW: Store original PIL image
-        self.map_image = None # Tkinter PhotoImage object for the map tile
-        self.last_size = (0, 0) # NEW: Track size to avoid redundant resizing
-        # NEW: Placeholder image if PIL is not available
-        self.placeholder_image = self._create_placeholder_image() if PIL_AVAILABLE else None
-        self.bind("<Configure>", self.on_resize)
-        self.last_update_time = 0
-        self.bind("<Double-Button-1>", self.on_double_click)
-        self.after(1000, self.draw_map) # Start the drawing loop (1 FPS)
-
-    def on_double_click(self, event):
-        """Handles double-click to teleport within the region."""
-        if not self.agent or not self.agent.client or not self.agent.running:
-            return
-
-        # Get canvas dimensions
-        width = self.winfo_width()
-        height = self.winfo_height()
-        dest_size = min(width, height)
-        
-        # Calculate offsets
-        offset_x = (width - dest_size) / 2
-        offset_y = (height - dest_size) / 2
-        
-        # Get click position relative to the map area
-        click_x_rel = event.x - offset_x
-        click_y_rel = event.y - offset_y
-        
-        # Check if click is within the map area
-        if click_x_rel < 0 or click_x_rel > dest_size or click_y_rel < 0 or click_y_rel > dest_size:
-            return
-            
-        # Convert to SIM coordinates (0-256)
-        # scale = dest_size / 256.0
-        # sim_x = click_x_rel / scale
-        # sim_y = (dest_size - click_y_rel) / scale (Y is inverted)
-        
-        scale = dest_size / 256.0
-        sim_x = click_x_rel / scale
-        sim_y = (dest_size - click_y_rel) / scale # Inverted Y for SL
-        
-        # Clamp coordinates to 0-255.9
-        sim_x = max(0.0, min(255.9, sim_x))
-        sim_y = max(0.0, min(255.9, sim_y))
-        
-        # Keep current altitude (Z)
-        current_z = getattr(self.agent.client, 'agent_z', 30.0)
-        
-        # Calculate RegionHandle
-        # Handle = (grid_y * 256) << 32 | (grid_x * 256)
-        gx = getattr(self.agent.client, 'grid_x', 0)
-        gy = getattr(self.agent.client, 'grid_y', 0)
-        
-        if gx == 0 and gy == 0:
-             self.agent.ui_callback("status", "❌ Cannot teleport: Unknown region coordinates.")
-             return
-
-        region_handle = (gy * 256) << 32 | (gx * 256)
-        
-        self.agent.log(f"DEBUG: LocalTeleport - Grid: {gx},{gy} Sim: {sim_x:.1f},{sim_y:.1f} Handle: {region_handle} (0x{region_handle:X})")
-        
-        # Create target position vector
-        target_pos = vector3(sim_x, sim_y, current_z)
-        
-        
-        region_name = self.agent.current_region_name
-        if not region_name and self.agent.client:
-             # Fallback to RegionClient's captured sim name (raw)
-             # We might need to clean it if it wasn't decoded safely
-             raw_name = self.agent.client.sim.get('name', '')
-             if raw_name:
-                 # It might be a variable object str() representation or a raw string
-                 # Attempt to clean it if it looks like variable(...)
-                 region_name = raw_name
-                 if "variable(" in str(region_name):
-                     # If we can't easily parse it, we might be stuck, but usually RegionClient uses str()
-                     # If RegionClient used str(variable), it might be messy. 
-                     # Let's hope RegionHandshake handler in SecondLifeAgent fired.
-                     pass
-                 else:
-                     # Strip nulls
-                     region_name = region_name.replace('\x00', '')
-
-        if region_name and region_name.lower() != "home":
-             self.agent.ui_callback("status", f"🏃 Hard Teleport (Relog) to {sim_x:.0f}, {sim_y:.0f}...")
-             self.agent.hard_teleport(region_name, sim_x, sim_y, current_z)
-        else:
-             self.agent.ui_callback("status", "❌ Cannot teleport: Unknown region name.")
-
-    def set_map_image(self, pil_image):
-        """Sets the source PIL image for the map."""
-        self.source_image = pil_image
-        self.last_size = (0, 0) # Force re-render
-        self.draw_map()
-
-    def _create_placeholder_image(self):
-        """Creates a default green circle image for the agent, using PIL."""
-        if not PIL_AVAILABLE: return None
-        
-        size = 10 
-        img = Image.new('RGBA', (size * 2, size * 2), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        # Draw a bright green circle in the center
-        draw.ellipse((0, 0, size * 2 - 1, size * 2 - 1), fill="#00FF00", outline="#00FF00")
-        
-        # Draw an arrow pointing up (representing direction)
-        # Arrow: Top center, slightly below center, bottom center
-        #draw.polygon([(size, 0), (size * 2, size), (0, size)], fill="#FFFFFF")
-        
-        # Save as a Tkinter object
-        return ImageTk.PhotoImage(img)
-
-
-    def on_resize(self, event):
-        # The canvas relies on its parent wrapper enforcing the square size.
-        self.draw_map()
-
-    def update_map_image(self, img_tk):
-        """Sets the Tkinter PhotoImage to be displayed. Deprecated for set_map_image."""
-        if img_tk is None:
-            self.source_image = None
-            self.map_image = None
-            self.last_size = (0, 0)
-        self.draw_map()
-
-    def draw_map(self):
-        # Clear canvas
-        self.delete("all")
-        
-        # Get the actual dimensions of the canvas
-        width = self.winfo_width()
-        height = self.winfo_height()
-        
-        if width <= 1 or height <= 1:
-             # Widget not fully initialized
-             if self.agent.running:
-                 self.after(100, self.draw_map)
-             return
-
-        dest_size = min(width, height)
-        # Calculate offsets to center the map content
-        offset_x = (width - dest_size) / 2
-        offset_y = (height - dest_size) / 2
-
-        # --- Handle Image Resizing ---
-        if PIL_AVAILABLE and self.source_image:
-             if (width, height) != self.last_size:
-                 # Resize needed
-                 try:
-                     # High quality resize
-                     resample = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
-                     resized = self.source_image.resize((int(dest_size), int(dest_size)), resample)
-                     self.map_image = ImageTk.PhotoImage(resized)
-                     self.last_size = (width, height)
-                 except Exception:
-                     pass
-
-        # --- Map Image/Placeholder Drawing ---
-        if self.map_image and PIL_AVAILABLE: # Only use image if PIL is available
-            # Display the actual image centered
-            self.create_image(width/2, height/2, image=self.map_image, anchor=tk.CENTER)
-            # Draw the region boundary over the image
-            self.create_rectangle(offset_x, offset_y, offset_x+dest_size, offset_y+dest_size, outline='#444444')
-        else:
-            # General placeholder when map is not loaded or failed
-            self.create_rectangle(offset_x, offset_y, offset_x+dest_size, offset_y+dest_size, fill='#303030', outline='#444444')
-            
-            # --- FIX: Show debug info on the canvas ---
-            gx = getattr(self.agent.client, 'grid_x', '?')
-            gy = getattr(self.agent.client, 'grid_y', '?')
-            debug_text = f"Map Unavailable\nGrid: {gx}, {gy}"
-            
-            center_x = width / 2
-            center_y = height / 2
-            if not PIL_AVAILABLE:
-                self.create_text(center_x, center_y, text="Pillow Missing!", fill='#FF0000')
-            else:
-                self.create_text(center_x, center_y, text=debug_text, fill='#888888', justify=tk.CENTER)
-        # --- End Map Image/Placeholder Drawing ---
-        
-        # --- Scale Factor ---
-        # 1.0 means 256 meters = dest_size pixels
-        scale = dest_size / self.size
-
-        # --- Other Avatars Drawing (Black Dots) ---
-        if self.agent.client and self.agent.running:
-            for coords in self.agent.client.other_avatars:
-                # Coarse coords are (x, y, z)
-                ox, oy, oz = coords
-                
-                # Apply scaling and offsets
-                x_other = ox * scale + offset_x
-                y_other = (self.size - oy) * scale + offset_y
-                
-                # Draw small BLACK dot (radius 3)
-                r = 3
-                self.create_oval(x_other - r, y_other - r, x_other + r, y_other + r,
-                                 fill="#000000", outline="#FFFFFF")
-                                 
-        # --- Agent Drawing (Own Location Indicator) ---
-        if self.agent.client and self.agent.running: # Only draw agent if running
-            # Agent Position (AgentUpdate/ImprovedTerseObjectUpdate is 0-256)
-            agent_x_sl = self.agent.client.agent_x 
-            agent_y_sl = self.agent.client.agent_y 
-            agent_rot_z = self.agent.client.agent_rot_z # Yaw in radians
-    
-            # Map to Canvas: X is proportional, Y is inverted (256-Y)
-            # Apply scaling and offsets
-            x_on_canvas = agent_x_sl * scale + offset_x
-            y_on_canvas = (self.size - agent_y_sl) * scale + offset_y
-            
-            # Draw Bullseye Indicator (Bright Cyan outer, White inner)
-            # Sized to be distinct but not overly large
-            r_outer = 3
-            r_inner = 1
-            
-            # Outer Bright Cyan Circle
-            self.create_oval(x_on_canvas - r_outer, y_on_canvas - r_outer, 
-                             x_on_canvas + r_outer, y_on_canvas + r_outer,
-                             fill="#00FFFF", outline="#000000", width=2)
-            
-            # Inner White Dot
-            self.create_oval(x_on_canvas - r_inner, y_on_canvas - r_inner,
-                             x_on_canvas + r_inner, y_on_canvas + r_inner,
-                             fill="#FFFFFF", outline="#000000")
-
-        # Schedule the next redraw
-        if self.agent.running:
-            self.after(1000, self.draw_map)
-        
-# --- Chat Tab ---
-class ChatTab(ttk.Frame):
-    """
-    Refactored ChatWindow as a ttk.Frame to be placed inside a Notebook.
-    Manages the UI and communication for a single logged-in agent.
-    """
-    def __init__(self, master, sl_agent, first, last, tab_manager):
-        super().__init__(master, style='BlackGlass.TFrame') 
-        self.sl_agent = sl_agent
-        self.my_first_name = first
-        self.my_last_name = last
-        self.tab_manager = tab_manager 
-        
-        self.pending_chat = {} # FIX: Store messages awaiting ACK echo
-        
-        # Update the agent's callback to target this specific tab
-        self.sl_agent.ui_callback = self.update_ui 
-        # FIX: The log handler needs to check for minimap updates
-        self.sl_agent.debug_callback = self.handle_debug_log_callback 
-        self.map_image = None # Added for the Tkinter PhotoImage object
-
-        self._set_style(master)
-        self._create_widgets()
-        self._bind_keys() # Movement key bindings
-        
-        # --- ROBUST MAP TRIGGER ---
-        # Trigger the map fetch shortly after the tab is created.
-        # This avoids the race condition where the handshake packet arrives before the UI exists.
-        def initial_map_load():
-            time.sleep(3.0) # Wait for connection stabilization
-            # Use current region or fallback to "map" (which logic handles)
-            r_name = self.sl_agent.current_region_name or "Home" 
-            self.sl_agent.fetch_map(r_name)
-            
-        threading.Thread(target=initial_map_load, daemon=True).start()
-        # --------------------------
-
-    def _set_style(self, master):
-        s = ttk.Style(master)
-        # Note: ChatTab relies on the styles defined in MultiClientApp
-        
-    # --- Helper to enforce square minimap ---
-    def _enforce_square(self, event):
-        """Forces the minimap wrapper to be a square based on its width."""
-        # Use the event width, and check if height is already configured to that value
-        # We check event.width > 1 to avoid issues during initialization/cleanup
-        if event.width != self.minimap_wrapper.winfo_height() and event.width > 1:
-            # Tell the widget to resize itself based on the width
-            self.minimap_wrapper.configure(height=event.width)
-    # --- End helper ---
-
-    def _bind_keys(self):
-        """Bind keyboard events for movement controls (Arrow Keys)."""
-        # Need to ensure the frame captures events, which means it needs to be focusable
-        self.focus_set() 
-        self.bind('<FocusIn>', self._on_focus_in)
-
-        # Bind Arrow Keys, E, C, and Space
-        for key in ['Up', 'Down', 'Left', 'Right', 'e', 'c', 'space', 'f']:
-            self.bind(f'<KeyPress-{key}>', self.on_key_press)
-            # The release event should only be bound for continuous controls
-            if key not in ['space', 'f']:
-                self.bind(f'<KeyRelease-{key}>', self.on_key_release)
-            # Bind KeyRelease-space explicitly for the jump flag
-            if key == 'space':
-                 self.bind(f'<KeyRelease-{key}>', self.on_key_release)
-        
-    def _on_focus_in(self, event):
-        """Called when the tab receives focus."""
-        # Ensure the frame stays focused when active
-        self.focus_set()
-        
-    def on_key_press(self, event):
-        """Handles key down event for movement."""
-        key = event.keysym
-        
-        # The key handlers only work if the input entry box is NOT focused
-        if self.message_entry != self.focus_get():
-            self.sl_agent.process_control_change(key, is_press=True)
-
-    def on_key_release(self, event):
-        """Handles key up event for movement."""
-        key = event.keysym
-        
-        # Release events only for continuous keys
-        if key in self.sl_agent.is_key_down:
-            self.sl_agent.process_control_change(key, is_press=False)
-
-
-    def _create_widgets(self):
-        
-        # Control Frame (top bar)
-        control_frame = ttk.Frame(self, style='BlackGlass.TFrame')
-        control_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(10, 5))
-        
-        self.agent_name_label = ttk.Label(control_frame, text=f"Agent: {self.my_first_name} {self.my_last_name}", style='BlackGlass.TLabel', font=('Helvetica', 12, 'bold'))
-        self.agent_name_label.pack(side=tk.LEFT, padx=5)
-        
-        teleport_button = ttk.Button(control_frame, text="Teleport...", command=self.do_teleport, style='BlackGlass.TButton')
-        teleport_button.pack(side=tk.RIGHT, padx=5)
-        
-        self.logout_button = ttk.Button(control_frame, text="Logout", command=self.on_closing, style='BlackGlass.TButton')
-        self.logout_button.pack(side=tk.RIGHT, padx=5)
-        
-        # --- Main Content Frame (Chat + Right Panel) ---
-        main_content_frame = ttk.Frame(self, style='BlackGlass.TFrame')
-        main_content_frame.pack(padx=(10, 0), pady=(0, 10), fill=tk.BOTH, expand=True)
-
-        # Configure 2 columns: Column 0 (Chat Log) expands, Column 1 (Minimap/Notification) fixed width.
-        main_content_frame.grid_columnconfigure(0, weight=1) 
-        main_content_frame.grid_columnconfigure(1, weight=0, minsize=256) 
-        main_content_frame.grid_rowconfigure(0, weight=1)
-
-        # 1. Chat Display (Column 0, Row 0 - Expanding)
-        self.chat_display = LimitedScrolledText(main_content_frame, max_lines=500, state='disabled', wrap=tk.WORD, height=15, 
-                                                     bg='#1C1C1C', fg='#E0E0E0', font=('Courier', 10), 
-                                                     insertbackground='white', 
-                                                     relief=tk.FLAT, highlightthickness=1, highlightbackground='#444444')
-        self.chat_display.grid(row=0, column=0, sticky='nsew', padx=(0, 0))
-        
-        # --- FIX: Configure tag for gray speaker name ---
-        self.chat_display.tag_config('speaker_name', foreground='#AAAAAA') 
-        # ------------------------------------------------
-
-        # 2. Right Panel Frame (Column 1, Row 0 - Contains Notifications and Minimap)
-        right_panel_frame = ttk.Frame(main_content_frame, style='BlackGlass.TFrame')
-        right_panel_frame.grid(row=0, column=1, sticky='nsew', padx=(0, 0))
-
-        # Configure rows in the Right Panel: Notifications (expanding) and Minimap (fixed height/square)
-        right_panel_frame.grid_columnconfigure(0, weight=1)
-        right_panel_frame.grid_rowconfigure(0, weight=1) # Notifications/Events (EXPAND)
-        right_panel_frame.grid_rowconfigure(1, weight=0) # Minimap (FIXED HEIGHT, ALIGNED BOTTOM)
-
-        # 2a. Event Notifications Area (Row 0 - Takes up remaining vertical space)
-        self.notification_area = LimitedScrolledText(right_panel_frame, max_lines=200, state='disabled', wrap=tk.WORD, height=5, 
-                                                     bg='#1C1C1C', fg='#FFFF00', font=('Courier', 9), 
-                                                     width=1, # <--- FIX: Explicitly set a small width so it doesn't push column width
-                                                     relief=tk.FLAT, highlightthickness=1, highlightbackground='#444444')
-        self.notification_area.insert(tk.END, "Event/Lure Notifications Here.\n(e.g., Teleport Offers)")
-        self.notification_area.grid(row=0, column=0, sticky='nsew', pady=(0, 0), padx=0)
-
-        # 2b. Minimap Wrapper (Row 1 - Fixed at the bottom and forces square aspect)
-        # Give it an initial size but let the grid manage its width
-        self.minimap_wrapper = ttk.Frame(right_panel_frame, style='BlackGlass.TFrame', width=256, height=256) # <--- FIX: Added explicit width/height=256
-        self.minimap_wrapper.grid(row=1, column=0, sticky='sew', padx=0, pady=0) # Aligned bottom (s), expands horizontally (ew)
-        
-        # Enforce square aspect ratio on the wrapper by binding Configure event
-        self.minimap_wrapper.bind("<Configure>", self._enforce_square)
-
-        # 2c. Minimap Canvas inside the wrapper
-        self.minimap = MinimapCanvas(self.minimap_wrapper, self.sl_agent)
-        self.minimap.pack(fill=tk.BOTH, expand=True) # Canvas fills the square wrapper
-
-
-        # Status Bar (bottom)
-        self.status_bar = ttk.Label(self, text="Status/Connection Info", style='BlackGlass.TStatus.Label')
-        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
-        
-        # Input Frame (above status bar)
-        input_frame = ttk.Frame(self, style='BlackGlass.TFrame')
-        input_frame.pack(padx=10, pady=(0, 10), fill=tk.X)
-        
-        self.message_entry = tk.Entry(input_frame, font=('Helvetica', 12), 
-                                      bg='#2C2C2C', fg='#FFFFFF', 
-                                      insertbackground='white', relief=tk.FLAT, highlightthickness=1, highlightbackground='#555555')
-        self.message_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        self.message_entry.bind("<Return>", self.send_message_event)
-        
-        self.send_button = ttk.Button(input_frame, text="Send", command=self.send_message, style='BlackGlass.TButton')
-        self.send_button.pack(side=tk.RIGHT)
-        
-        # --- FIX: Set initial status to a generic placeholder. The login process will update it. ---
-        self._update_status(f"Initialized.")
-        # --- END FIX ---
-
-    def _start_map_fetch_task(self, region_name):
-        """Starts the map image download thread."""
-        self._append_notification(f"[INFO] Requesting map tile for {region_name}...")
-        # Clear old map immediately
-        self.minimap.update_map_image(None) 
-        self.sl_agent.fetch_map(region_name)
-
-    def _handle_map_image_data(self, map_data):
-        """Handles the image data received from the fetch thread, now using PIL."""
-        if not PIL_AVAILABLE:
-            self._append_notification("[FATAL] PIL/Pillow missing. Cannot display map image.")
-            self.minimap.update_map_image(None) 
-            return
-            
-        if map_data is None or len(map_data) < 1000: # Check is now > 1000 bytes
-            self._append_notification("[WARN] Map tile unavailable or failed to load. (Network/Source error)")
-            self.minimap.update_map_image(None) # Clear any previous map
-            return
-
-        try:
-            # Open the image from bytes stream using PIL
-            image = Image.open(BytesIO(map_data))
-            
-            # We no longer resize here; we pass the source image to the minimap canvas
-            # which handles resizing effectively.
-            
-            self.minimap.set_map_image(image)
-            # self._append_notification("[SUCCESS] Map tile loaded and displayed.")
-
-            
-        except ImportError:
-            # Should not happen if Pillow is installed
-            self._append_notification("[FATAL] PIL/Pillow missing. Cannot display map image.")
-            self.minimap.update_map_image(None) 
-        except Exception as e:
-            self._append_notification(f"[ERROR] Failed to process map image data: {e}")
-            self.minimap.update_map_image(None)
-
-        
-    def handle_debug_log_callback(self, message):
-        """Processes the debug log message, checking for special minimap update triggers."""
-        
-        # --- FIX: Add HANDSHAKE_COMPLETE to the log handler ---
-        if message.startswith("HANDSHAKE_COMPLETE"):
-            _, region_name = message.split(", ", 1)
-            region_name = region_name.strip()
-            self.after(0, self._update_status, f"🟢 Successfully logged in to {region_name}!")
-            self.after(0, self._append_notification, f"[INFO] Logged in to {region_name}. Requesting map...")
-            
-            # --- FIX: Trigger Map Fetch via UI method (clears old map first) ---
-            # Wait 2 seconds to ensure coordinates are stable
-            # Use _start_map_fetch_task to ensure we clear the old map visually first
-            # REMOVED: Redundant map fetch. Now handled directly in RegionHandshake handler.
-            # self.after(2000, lambda: self._start_map_fetch_task(region_name))
-            
-        # --- KICKED LOG HANDLER (NEW) ---
-        elif message.startswith("KICKED"):
-            _, reason = message.split(", ", 1)
-            # Pass the kick reason to the status update
-            self.after(0, self._update_status, f"🔴 Kicked: {reason.strip()}")
-            self.after(0, self._set_disconnected_ui)
-        # --- END KICKED LOG HANDLER ---
-            
-        elif message == "MINIMAP_UPDATE":
-             # Use self.after to redraw safely from the main thread
-             # REDUNDANT: MinimapCanvas already has a loop. Removing this prevents event queue flooding.
-             pass 
-             
-        elif message.startswith("[CHAT]"):
-            # Some old scripts might still be sending messages prefix with [CHAT]
-            clean = message.replace("[CHAT]", "").strip()
-            self.after(0, self._append_chat, clean)
-            
-        elif message.startswith("[SPY]"):
-             # Ignore SPY packets in the UI entirely
-             pass
-             
-        else:
-             # SILENCED: No longer route generic debug messages to the notification area
-             # Still pass on to the application's central debug handler for logging if needed
-             self.tab_manager.handle_debug_log(message)
-
-
-    def update_ui(self, update_type, message):
-        """Thread-safe update of the GUI."""
-        if update_type == "chat":
-            if isinstance(message, (list, tuple)) and len(message) == 2:
-                name, text = message
-                self.after(0, self._append_chat, text, name)
-            else:
-                self.after(0, self._append_chat, message)
-        elif update_type == "chat_ack":
-            # message is the sequence number
-            seq_id = message
-            if seq_id in self.pending_chat:
-                confirmed_msg = self.pending_chat.pop(seq_id)
-                # Fetch self display name
-                agent_id = self.sl_agent.client.agent_id if self.sl_agent.client else None
-                from_name = f"{self.my_first_name} {self.my_last_name}"
-                display_name = self.sl_agent.get_display_name(agent_id, from_name)
-                
-                # FIX: Avoid printing the same name twice
-                if display_name and display_name != from_name:
-                    name_label = f"{display_name} ({from_name})"
-                    self.after(0, self.agent_name_label.config, {'text': f"Agent: {name_label}"})
-                else:
-                    name_label = from_name
-                    
-                self.after(0, self._append_chat, confirmed_msg, name_label)
-        elif update_type == "status":
-            # This is primarily used for connection/teleport status updates
-            self.after(0, self._update_status, message)
-        elif update_type == "notification": # NEW: Generic notification handler
-             self.after(0, self._append_notification, message)
-        elif update_type == "error":
-            # Use custom ThemedMessageBox for critical errors
-            self.after(0, lambda: ThemedMessageBox(self.master, f"{self.my_first_name} Error", message, 'error'))
-            self.after(0, self._update_status, f"Error: {message}")
-            self.after(0, self._set_disconnected_ui) # Disable chat/send on error
-        elif update_type == "teleport_offer":
-            # Use the notification area for a non-critical alert, but keep the standard dialog for user action
-            self.after(0, self._append_notification, f"[ALERT] Teleport offer received to {message['region']}.")
-            self.after(0, self._show_teleport_offer, message)
-        elif update_type == "map_fetch_request":
-            # Handle map fetch request triggered by RegionClient
-            self.after(0, lambda: self._start_map_fetch_task(message))
-        elif update_type == "delayed_map_fetch":
-            # NEWROBUSTMETHOD: Wait 2.5s then fetch map
-            self.after(2500, lambda: self.sl_agent.fetch_map(message))
-        elif update_type == "map_image_fetched":
-            # Handle image data received from the fetch thread
-            self.after(0, lambda: self._handle_map_image_data(message))
-            
-        elif update_type == "update_display_name":
-            # Handle asynchronous display name update
-            uid, dname = message
-            self.after(0, lambda: self.update_display_name(uid, dname))
-            
-        elif update_type == "clear_map":
-            # Clear the minimap image (e.g. on logout/teleport start)
-            self.after(0, lambda: self.minimap.update_map_image(None))
-
-
-    def update_display_name(self, uid, display_name):
-        """Updates the UI when a display name is resolved."""
-        # 1. Update the top bar label if it's the current agent
-        if self.sl_agent.client and str(self.sl_agent.client.agent_id) == str(uid):
-            full_name = f"{self.my_first_name} {self.my_last_name}"
-            clean_full_name = full_name.replace(" Resident", "")
-            
-            if display_name != full_name:
-                self.agent_name_label.config(text=f"Agent: {display_name} ({clean_full_name})")
-            else:
-                self.agent_name_label.config(text=f"Agent: {clean_full_name}")
-                
-        # 2. (Future) Retroactive chat log updates could be implemented here if messages were tagged.
-
-
-    def _append_chat(self, message, name=None):
-        self.chat_display.config(state='normal')
-        
-        if name:
-            self.chat_display.insert(tk.END, "[")
-            self.chat_display.insert(tk.END, name, 'speaker_name')
-            self.chat_display.insert(tk.END, "]: " + message + "\n")
-        else:
-            self.chat_display.insert(tk.END, message + "\n")
-            
-        self.chat_display.config(state='disabled')
-        self.chat_display.see(tk.END) 
-                
-    def _append_notification(self, message):
-        self.notification_area.config(state='normal')
-        self.notification_area.insert(tk.END, message + "\n", 'alert')
-        self.notification_area.config(state='disabled')
-        self.notification_area.see(tk.END) 
-        
-    def _update_status(self, message):
-        self.status_bar.config(text=message, foreground='#FFFFFF') 
-        
-        if message.startswith("🟢 Successfully logged in"): 
-            self.status_bar.config(foreground='#00FF00') 
-        elif "Teleport finished" in message or "Waiting for confirmation" in message:
-             self.status_bar.config(foreground='#00FFFF') 
-        elif "Error" in message or "Teleport failed" in message:
-             self.status_bar.config(foreground='#FF0000') 
-        # MODIFIED: Removed auto-close logic, now using a dedicated function for visual feedback
-        elif "Disconnected" in message or message.startswith("🔴 Kicked"):
-             self._set_disconnected_ui()
-
-    # --- NEW METHOD (Start) ---
-    def _set_disconnected_ui(self):
-        """Sets the UI to a disconnected state."""
-        self.status_bar.config(foreground='#FF0000') 
-        self.message_entry.config(state='disabled')
-        self.send_button.config(state='disabled')
-        # Change the Logout button to a Close Tab button
-        self.logout_button.config(text="Close Tab", command=lambda: self.tab_manager.remove_tab(self.my_first_name, self)) 
-    # --- NEW METHOD (End) ---
-
-    # --- NEW METHOD: Missing log callback ---
-            
-    def _show_teleport_offer(self, offer_data):
-        region_name = offer_data['region']
-        cost = offer_data['cost']
-        teleport_id = offer_data['id']
-        
-        dialog_text = f"You have received a teleport offer to: {region_name}"
-        if cost > 0:
-            dialog_text += f"\nThis teleport will cost L${cost}."
-        
-        self.sl_agent.log(f"Teleport offer received for {region_name} (Cost: L${cost}).")
-        
-        # MODIFIED: Use ThemedMessageBox instead of messagebox.askyesno
-        dialog_result = ThemedMessageBox(self.master, "Teleport Offer Received", dialog_text, 'yesno').result
-        
-        if dialog_result:
-            self.sl_agent.accept_teleport_offer(teleport_id, cost)
-            self._update_status(f"✅ Accepting teleport to {region_name}...")
-        else:
-            self._update_status("Teleport offer declined.")
-            self._append_notification(f"[INFO] Teleport offer to {region_name} declined.")
-
-    def send_message_event(self, event):
-        self.send_message()
-        return "break"
-
-    def send_message(self):
-        message = self.message_entry.get().strip()
-        if not message:
-            return
-            
-        # --- COMMAND INTERCEPTION ---
-        if message.lower().startswith("/hardtp ") or message.lower().startswith("/relog "):
-            parts = message.split(' ', 1)
-            if len(parts) > 1:
-                region_name = parts[1].strip()
-                self.sl_agent.hard_teleport(region_name)
-                self.message_entry.delete(0, tk.END)
-                return
-            else:
-                self._append_notification("[USAGE] /hardtp <region_name> or /relog <region_name>")
-                self.message_entry.delete(0, tk.END)
-                return
-        # ----------------------------
-        
-        # sequence is returned from send_chat
-        seq_id = self.sl_agent.send_chat(message)
-        
-        if seq_id:
-            # Store it so we can echo it only when ACKed
-            self.pending_chat[seq_id] = message
-            
-        self.message_entry.delete(0, tk.END)
-
-    def do_teleport(self):
-        # MODIFIED: Use ThemedAskString instead of simpledialog.askstring
-        region_name = ThemedAskString.askstring(self.master, "Teleport", "Enter the name of the region to teleport to:")
-        
-        if region_name:
-            # FIX: User requested Hard Teleport as the default for the button
-            self.sl_agent.hard_teleport(region_name.strip())
-
-    def on_closing(self):
-        """Handles the user-initiated logout."""
-        # Only prompt if the agent is still running
-        if self.sl_agent.running:
-            # MODIFIED: Use ThemedMessageBox instead of messagebox.askyesno
-            dialog_result = ThemedMessageBox(self.master, "Logout", f"Are you sure you want to log out {self.my_first_name} and close this tab?", 'yesno').result
-        else:
-            # If the agent is not running (e.g., disconnected/kicked), just ask to close the tab.
-            dialog_result = True 
-        
-        if dialog_result:
-            # Tell the minimap loop to stop
-            try:
-                 self.minimap.after_cancel(self.minimap.draw_map)
-            except:
-                 pass # May already be stopped
-            self.sl_agent.stop()
-            self.tab_manager.remove_tab(self.my_first_name, self)
-            
-# ----------------------------------------------------------------------
-
-class LoginPanel(ttk.Frame):
-    """
-    A single frame containing the login form and credential management logic.
-    """
-    def __init__(self, master, app_instance):
-        super().__init__(master, style='BlackGlass.TFrame')
-        self.app_instance = app_instance
-        self.credentials = load_credentials()
-        self._set_style(master)
-        self._create_widgets()
-        
-    def _set_style(self, master):
-        s = ttk.Style(self)
-        
-        # Dropdown style (TCombobox) 
-        s.configure('BlackGlass.TCombobox', 
-                    fieldbackground='#2C2C2C', 
-                    foreground='#FFFFFF', 
-                    selectbackground='#00FFFF',
-                    selectforeground='#1C1C1C',
-                    background='#1E1E1E',
-                    bordercolor='#444444',
-                    relief='flat')
-        s.map('BlackGlass.TCombobox', 
-              background=[('readonly', '#1E1E1E')],
-              fieldbackground=[('readonly', '#2C2C2C')],
-              foreground=[('readonly', '#FFFFFF')])
-
-        # Style for the dropdown list items
-        master.option_add('*TCombobox*Listbox.background', '#1C1C1C')
-        master.option_add('*TCombobox*Listbox.foreground', '#FFFFFF')
-        master.option_add('*TCombobox*Listbox.selectBackground', '#00FFFF')
-        master.option_add('*TCombobox*Listbox.selectForeground', '#1C1C1C')
-        
-    def _create_widgets(self):
-        content_frame = ttk.Frame(self, style='BlackGlass.TFrame', padding=20)
-        content_frame.pack(padx=10, pady=10)
-
-        content_frame.grid_columnconfigure(0, weight=0) 
-        content_frame.grid_columnconfigure(1, weight=1)
-
-        row = 0
-        
-        # 1. Saved Credentials Dropdown
-        ttk.Label(content_frame, text="Saved Profile:", style='BlackGlass.TLabel', anchor='e').grid(row=row, column=0, sticky='e', pady=5, padx=5)
-        
-        self.profile_names = ["-- New Login --"] + [f"{c['first']} {c['last']} ({c['region']})" for c in self.credentials]
-        self.selected_profile = tk.StringVar(value=self.profile_names[0])
-        
-        self.profile_dropdown = ttk.Combobox(content_frame, 
-                                             textvariable=self.selected_profile, 
-                                             values=self.profile_names, 
-                                             state="readonly", 
-                                             width=30,
-                                             style='BlackGlass.TCombobox')
-        self.profile_dropdown.grid(row=row, column=1, sticky='ew', pady=5)
-        self.profile_dropdown.bind("<<ComboboxSelected>>", self._fill_credentials)
-        row += 1
-        
-        ttk.Separator(content_frame, orient='horizontal').grid(row=row, column=0, columnspan=2, sticky='ew', pady=(10, 10))
-        row += 1
-        
-        # 2. Input Fields
-        ttk.Label(content_frame, text="First Name:", style='BlackGlass.TLabel', anchor='e').grid(row=row, column=0, sticky='e', pady=5, padx=5)
-        self.first_name_entry = tk.Entry(content_frame, width=25, bg='#2C2C2C', fg='#FFFFFF', insertbackground='white', relief=tk.FLAT)
-        self.first_name_entry.grid(row=row, column=1, sticky='ew', pady=5)
-        row += 1
-        
-        ttk.Label(content_frame, text="Last Name:", style='BlackGlass.TLabel', anchor='e').grid(row=row, column=0, sticky='e', pady=5, padx=5)
-        self.last_name_entry = tk.Entry(content_frame, width=25, bg='#2C2C2C', fg='#FFFFFF', insertbackground='white', relief=tk.FLAT)
-        self.last_name_entry.grid(row=row, column=1, sticky='ew', pady=5)
-        row += 1
-        
-        ttk.Label(content_frame, text="Password:", style='BlackGlass.TLabel', anchor='e').grid(row=row, column=0, sticky='e', pady=5, padx=5)
-        self.password_entry = tk.Entry(content_frame, show='*', width=25, bg='#2C2C2C', fg='#FFFFFF', insertbackground='white', relief=tk.FLAT)
-        self.password_entry.grid(row=row, column=1, sticky='ew', pady=5)
-        row += 1
-
-        ttk.Label(content_frame, text="Start Region:", style='BlackGlass.TLabel', anchor='e').grid(row=row, column=0, sticky='e', pady=5, padx=5)
-        self.region_entry = tk.Entry(content_frame, width=25, bg='#2C2C2C', fg='#FFFFFF', insertbackground='white', relief=tk.FLAT)
-        self.region_entry.insert(0, "last") # Default is now "last"
-        self.region_entry.grid(row=row, column=1, sticky='ew', pady=5)
-        row += 1
-        
-        # 4. Login Button (Now at row 5)
-        self.login_button = ttk.Button(content_frame, text="Login", command=self.start_login, width=15, style='BlackGlass.TButton')
-        self.login_button.grid(row=row, column=0, columnspan=2, pady=(15, 10)) 
-        row += 1
-        
-        # 5. Status and Progress 
-        self.progress_bar = ttk.Progressbar(content_frame, orient='horizontal', length=180, mode='determinate', style='BlackGlass.TProgressbar')
-        self.progress_bar.grid(row=row, column=0, columnspan=2, pady=5) 
-        self.progress_bar['value'] = 0 
-        row += 1
-
-        self.status_label = ttk.Label(content_frame, text="Enter credentials or select a profile.", style='BlackGlass.TStatus.Label')
-        self.status_label.grid(row=row, column=0, columnspan=2, pady=(5, 0))
-        
-        # Note: Removed default filling of the first saved profile to ensure a blank slate.
-
-    def reset_fields(self):
-        """Resets all input fields, profile selection, and UI state after a login."""
-        self.first_name_entry.delete(0, tk.END)
-        self.last_name_entry.delete(0, tk.END)
-        self.password_entry.delete(0, tk.END)
-        self.region_entry.delete(0, tk.END)
-        
-        # Set defaults
-        self.region_entry.insert(0, "last") # Reset to "last"
-        
-        # Reload and reset dropdown to the first option ("-- New Login --")
-        self.update_dropdown_data()
-        self.selected_profile.set(self.profile_names[0])
-        
-        # Reset UI controls
-        self.login_button.config(state=tk.NORMAL, text="Login")
-        self.progress_bar.config(value=0)
-        # Reset status text and color to initial state
-        self.status_label.config(text="Enter credentials or select a profile.", foreground='grey')
-
-    # --- NEW METHOD (Start) ---
-    def update_dropdown_data(self):
-        """Loads credentials and refreshes the dropdown without destroying the panel."""
-        self.credentials = load_credentials()
-        self.profile_names = ["-- New Login --"] + [f"{c['first']} {c['last']} ({c['region']})" for c in self.credentials]
-        
-        # Reconfigure the combobox with new values
-        self.profile_dropdown.config(values=self.profile_names)
-        
-        # If the currently selected text is no longer valid, default back to 'New Login'.
-        if self.selected_profile.get() not in self.profile_names:
-            self.selected_profile.set(self.profile_names[0])
-    # --- NEW METHOD (End) ---
-
-
-    def _fill_credentials(self, event=None):
-        """Fills entry fields based on the selected profile."""
-        selection_index = self.profile_dropdown.current()
-        
-        # Clear fields first
-        self.first_name_entry.delete(0, tk.END)
-        self.last_name_entry.delete(0, tk.END)
-        self.password_entry.delete(0, tk.END)
-        self.region_entry.delete(0, tk.END)
-        
-        # Re-insert default region or load profile data
-        self.region_entry.insert(0, "last") # Default insert is "last"
-        self.status_label.config(text="Enter credentials or select a profile.", foreground='grey')
-
-        if selection_index > 0:
-            creds = self.credentials[selection_index - 1]
-            
-            self.first_name_entry.insert(0, creds['first'])
-            self.last_name_entry.insert(0, creds['last'])
-            self.password_entry.insert(0, creds['password'])
-            self.region_entry.delete(0, tk.END)
-            self.region_entry.insert(0, creds['region'])
-
-    # --- MODIFIED METHOD (Start) ---
-    def start_login(self, event=None):
-        # Guard against double submission if the button is already disabled (login in progress)
-        if self.login_button['state'] == tk.DISABLED:
-            return
-
-        first = self.first_name_entry.get().strip()
-        last = self.last_name_entry.get().strip()
-        password = self.password_entry.get()
-        raw_region_name = self.region_entry.get().strip()
-        
-        if not first or not last or not password:
-            self.app_instance.after(0, self.status_label.config, {'text': "All fields are required.", 'foreground': '#FF0000'})
-            return
-
-        # UI state change
-        self.login_button.config(state=tk.DISABLED, text="Connecting...")
-        self.status_label.config(text="Attempting login...", foreground="#00FFFF")
-        self.progress_bar['value'] = 0 
-        
-        # Auto-save credentials (as requested)
-        save_credentials({'first': first, 'last': last, 'password': password, 'region': raw_region_name})
-        
-        # Update the dropdown list data without destroying the panel/entries
-        self.update_dropdown_data()
-             
-        # Format region string: 'home'/'last' are passed raw. Others are formatted as a URI for the login server.
-        if raw_region_name.lower() in ("home", "last"):
-             formatted_region_name = raw_region_name.lower()
-        else:
-             # Use URI format for actual region names
-             encoded_region_name = urllib.parse.quote(raw_region_name)
-             
-             # FIX: Use ampersands '&' instead of slashes '/' as separators for the region URI.
-             formatted_region_name = f"uri:{encoded_region_name}&128&128&30" 
-             
-        self.login_thread = threading.Thread(target=self.app_instance.login_task, 
-                                             args=(first, last, password, formatted_region_name, self), 
-                                             daemon=True)
-        self.login_thread.start()
-    # --- MODIFIED METHOD (End) ---
-
-# ----------------------------------------------------------------------
-
-class MultiClientApp(tk.Tk):
-    """
-    The main application window, now hosting a tabbed interface.
-    """
+    def parse_start_location(input_str):
+        slurl_pattern = r"secondlife/([^/]+)(?:/(\d+))?(?:/(\d+))?(?:/(\d+))?"
+        match = re.search(slurl_pattern, input_str)
+        if match:
+            region = urllib.parse.unquote(match.group(1))
+            x = match.group(2) or "128"
+            y = match.group(3) or "128"
+            z = match.group(4) or "25"
+            return f"uri:{region}&{x}&{y}&{z}"
+
+        if "/" in input_str and not input_str.startswith("http"):
+            parts = input_str.split('/')
+            region = parts[0].strip()
+            x = parts[1].strip() if len(parts) > 1 else "128"
+            y = parts[2].strip() if len(parts) > 2 else "128"
+            z = parts[3].strip() if len(parts) > 3 else "25"
+            return f"uri:{region}&{x}&{y}&{z}"
+
+        if input_str.lower() in ["home", "last"]:
+            return getattr(StartLocation, input_str.upper())
+
+        return f"uri:{input_str}&128&128&25"
+
+# ==========================================
+# SECTION 2: SHARED STATE & Q-LEARNING
+# ==========================================
+
+class LimitedList:
+    """Thread-safe wrapped list (Prevents NoneType C-struct inheritance crashes)."""
+    def __init__(self, limit=200):
+        self.limit = limit
+        self.data = []
+    def append(self, item):
+        self.data.append(item)
+        if len(self.data) > self.limit:
+            self.data.pop(0)
+    def as_list(self):
+        return list(self.data)
+
+class SharedState:
     def __init__(self):
-        super().__init__()
-        self.title("Black Glass")
-        self.geometry("800x650") 
-        self.protocol("WM_DELETE_WINDOW", self.on_closing)
-        self.resizable(True, True)
-        self.eval('tk::PlaceWindow . center')
-        
-        # Global Enter Key Binding
-        self.bind("<Return>", self.handle_global_return)
+        self.lock = threading.Lock()
+        self.messages = LimitedList(200)
+        self.map_data = None
+        self.current_region = "Unknown"
+        self.nearby_avatars = []
+        self.pos = {"x": 128.0, "y": 128.0, "z": 0.0}
+        self.sim_fps = 45.0
+        self.time_dilation = 1.0
+        self.connected = False
+        self.grid_x = 0
+        self.grid_y = 0
+        self.full_name = "User"
 
-        self.active_agents = {} 
-        self.login_panel = None # Will hold the instance of LoginPanel
+    def log(self, text, msg_type="info", meta=None):
+        print(f"[{msg_type.upper()}] {text}")
+        msg_obj = {"time": time.strftime("%H:%M:%S"), "text": text, "type": msg_type}
+        if meta: msg_obj["meta"] = meta
+        with self.lock: self.messages.append(msg_obj)
+
+    def update_pos(self, x, y, z):
+        with self.lock: self.pos = {"x": float(x), "y": float(y), "z": float(z)}
+
+    def update_nearby(self, avatars):
+        with self.lock: self.nearby_avatars = list(avatars)
+
+    def update_region(self, name, grid_x=None, grid_y=None):
+        with self.lock:
+            if name and name != "Unknown":
+                self.current_region = name
+            if grid_x and grid_x > 0: self.grid_x = grid_x
+            if grid_y and grid_y > 0: self.grid_y = grid_y
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "messages": self.messages.as_list(),
+                "map": self.map_data,
+                "region": self.current_region,
+                "nearby": list(self.nearby_avatars),
+                "stats": {"fps": self.sim_fps, "dilation": self.time_dilation, "pos": dict(self.pos)}
+            }
+
+class QLearningDrive:
+    """Manual AgentDrive Neural Net (Continuous ControlFlag Movement)."""
+    def __init__(self, state):
+        self.state = state
+        self.active = False
+        self.target_pos = None
+
+    def toggle(self):
+        self.active = not self.active
+        self.target_pos = None
+        return self.active
+
+    @property
+    def pos(self):
+        p = self.state.pos
+        return type('V', (), {'x': p['x'], 'y': p['y'], 'z': p['z']})()
+
+    def dist_xy(self, x1, y1, x2, y2): 
+        return ((x1 - x2)**2 + (y1 - y2)**2)**0.5
+
+    def decide(self):
+        if not self.active: return 0, (0, 0, 0, 1)
+        me = self.pos
         
-        # --- Application Icon ---
+        # Determine Waypoint
+        if not self.target_pos or self.dist_xy(me.x, me.y, self.target_pos[0], self.target_pos[1]) < 2.0:
+            self.target_pos = (random.randint(20, 236), random.randint(20, 236))
+            self.state.log(f"AI AUTOPILOT: Routing to Sector <{self.target_pos[0]}, {self.target_pos[1]}>", "system")
+        
+        # Calculate Angular Rotation
+        dx = self.target_pos[0] - me.x
+        dy = self.target_pos[1] - me.y
+        target_angle = math.atan2(dy, dx)
+        
+        qz = math.sin(target_angle / 2.0)
+        qw = math.cos(target_angle / 2.0)
+        
+        # 1 = AT_FORWARD (Walk Control Flag)
+        return 1, (0, 0, qz, qw)
+
+# ==========================================
+# SECTION 3: HIPPO CLIENT
+# ==========================================
+
+class HippoSLClient:
+    def __init__(self):
+        self.state = SharedState()
+        self.neural = QLearningDrive(self.state)
+        self._hippo = None
+        self._loop = None
+
+    def log(self, text, msg_type="info", meta=None):
+        self.state.log(text, msg_type, meta)
+
+    def login(self, first, last, password, start_input="last"):
+        self.state.log(f"Resolving Location: {start_input}...", "system")
+        start_loc = SmartParser.parse_start_location(start_input)
+        self.state.log(f"Target URI: {start_loc}", "system")
+        self.state.full_name = f"{first} {last}"
+
+        # DEEP-FIX: Extract UI Region Name directly from URI
+        if start_loc.startswith("uri:"):
+            r_name = urllib.parse.unquote(start_loc[4:].split('&')[0])
+            self.state.update_region(r_name)
+
+        self._loop = asyncio.new_event_loop()
+        login_done = threading.Event()
+        login_result = [False]
+
+        def run_loop():
+            asyncio.set_event_loop(self._loop)
+            self._loop.run_until_complete(self._async_main(first, last, password, start_loc, login_done, login_result))
+
+        threading.Thread(target=run_loop, daemon=True).start()
+        login_done.wait(timeout=45)
+        return login_result[0]
+
+    async def _async_main(self, first, last, password, start_loc, login_done, login_result):
+        self._hippo = HippoClient()
         try:
-             icon_path = "BlackGlass.ico"
-             if os.path.exists(icon_path):
-                 self.iconbitmap(default=icon_path)
-             else:
-                 print("Warning: BlackGlass.ico not found. Using default icon.")
-        except Exception as e:
-             print(f"Warning: Failed to set application icon: {e}")
-
-        self._set_style()
-        self._create_widgets()
-
-    def _set_style(self):
-        self.configure(bg='#0A0A0A') 
-        s = ttk.Style(self)
-        s.theme_use('clam')
-        
-        # Black Glass Frame/Background
-        s.configure('BlackGlass.TFrame', background='#0A0A0A')
-        
-        # Black Glass Labels
-        s.configure('BlackGlass.TLabel', background='#0A0A0A', foreground='#F0F0F0', font=('Helvetica', 10))
-        
-        # Sleek Button
-        s.configure('BlackGlass.TButton', background='#1E1E1E', foreground='#00FFFF', relief='flat', borderwidth=0, font=('Helvetica', 12, 'bold'))
-        s.map('BlackGlass.TButton', background=[('active', '#333333'), ('pressed', '#000000')], foreground=[('active', '#FFFFFF')])
-        
-        # Progressbar (Fix)
-        s.configure('BlackGlass.TProgressbar', 
-                    background='#00FFFF',          
-                    troughcolor='#1C1C1C',         
-                    bordercolor='#444444',         
-                    thickness=10                   
-                   )
-        s.layout('BlackGlass.TProgressbar', 
-                 [('Horizontal.Progressbar.trough', 
-                   {'children': 
-                    [('Horizontal.Progressbar.pbar', 
-                      {'side': 'left', 'sticky': 'ns'})], 
-                    'sticky': 'ew'})])
-
-        # Notebook (Tab) style - Black Glass
-        s.configure('BlackGlass.TNotebook', background='#0A0A0A', borderwidth=0)
-        s.configure('BlackGlass.TNotebook.Tab', 
-                    background='#1E1E1E',        # Background of unselected tabs
-                    foreground='#FFFFFF',        # Text of unselected tabs
-                    padding=[10, 5],
-                    font=('Helvetica', 10, 'bold'))
-        s.map('BlackGlass.TNotebook.Tab', 
-              background=[('selected', '#0A0A0A')], 
-              foreground=[('selected', '#00FFFF')]  
-             )
-        
-        # Status Label
-        s.configure('BlackGlass.TStatus.Label', background='#0A0A0A', foreground='grey', anchor='center')
-
-    def _create_widgets(self):
-        # Create the notebook and set it up
-        self.notebook = ttk.Notebook(self, style='BlackGlass.TNotebook')
-        self.notebook.pack(pady=10, padx=10, expand=True, fill='both')
-
-        # Add the initial login panel tab
-        self.login_panel = LoginPanel(self.notebook, self)
-        self.notebook.add(self.login_panel, text="➕ New Login")
-
-    # --- FIXED METHOD: Added robust error handling and simplified selection ---
-    def reload_login_tab(self):
-        """Reloads the login panel to refresh the saved profiles dropdown."""
-        
-        # 1. Save old reference and state
-        old_panel = self.login_panel
-        is_selected = self.notebook.select() == str(old_panel)
-        
-        # 2. Remove the old panel
-        try:
-             # Use the old instance reference to ensure removal
-             self.notebook.forget(old_panel) 
-        except tk.TclError:
-             pass
-        
-        # 3. Create the new panel and update the class attribute
-        self.login_panel = LoginPanel(self.notebook, self)
-
-        # 4. Insert the new panel, with a robust fallback
-        try:
-             # Attempt the preferred insertion at index 0
-             self.notebook.insert(0, self.login_panel, text="➕ New Login")
-        except tk.TclError:
-             # If index 0 fails, safely add it to the end (will be index -1)
-             self.notebook.add(self.login_panel, text="➕ New Login")
-        
-        # 5. Set focus back, using the widget instance
-        if is_selected:
-             self.notebook.select(self.login_panel)
-    # --- END FIXED METHOD ---
-
-
-    def login_task(self, first, last, password, region_name, login_panel_instance):
-        """
-        Runs in a thread, attempts login, and calls back to the UI thread.
-        login_panel_instance is the stale object, all resets must use self.login_panel.
-        """
-        agent = SecondLifeAgent(self.handle_agent_update, debug_callback=self.handle_debug_log)
-        
-        try:
-            agent.login(first, last, password, region_name)
+            await self._hippo.login(username=f"{first} {last}", password=password, start_location=start_loc, agree_to_tos=True)
             
-            # Login successful: Callback to the UI thread to add the chat tab
-            # FIX: Only pass agent info. Use self.login_panel for UI updates.
-            self.after(0, self._add_chat_tab, agent, first, last)
+            timeout = 15
+            while not self._hippo.main_circuit and timeout > 0:
+                await asyncio.sleep(0.5); timeout -= 0.5
+            if not self._hippo.main_circuit: raise Exception("UDP Circuit Timeout")
+
+            pres_msg = Message("CompleteAgentMovement", Block("AgentData", 
+                AgentID=self._hippo.session.agent_id, SessionID=self._hippo.session.id, 
+                CircuitCode=self._hippo.session.login_data['circuit_code']))
+            self._hippo.main_circuit.send(pres_msg)
+
+            login_data = self._hippo.session.login_data
+            if "region_x" in login_data and "region_y" in login_data:
+                gx = int(login_data["region_x"]) // 256
+                gy = int(login_data["region_y"]) // 256
+                self.state.update_region(self.state.current_region, gx, gy)
+            
+            self.state.connected = True
+            login_result[0] = True
+            login_done.set()
+
+            h = self._hippo.session.message_handler
+            h.subscribe("ChatFromSimulator", self._on_chat)
+            h.subscribe("ImprovedInstantMessage", self._on_im)
+            h.subscribe("RegionHandshake", self._on_region_handshake)
+            h.subscribe("TeleportFinish", self._on_teleport_finish)
+            h.subscribe("ObjectUpdate", self._on_object_update)
+
+            self._fetch_map()
+
+            while self.state.connected:
+                try:
+                    self._sync_state()
+                    
+                    if self.neural.active:
+                        controls, rot = self.neural.decide()
+                    else:
+                        controls, rot = 0, (0, 0, 0, 1)
+
+                    await self._send_agent_update(controls, rot)
+
+                except Exception as e:
+                    print(f"[LOOP_ERR] {e}")
+                    import traceback; traceback.print_exc()
                 
+                # Poll faster (0.2s) to maintain AI walking fluidity
+                await asyncio.sleep(0.2)
+
         except Exception as e:
-            # Login failed: Use after to safely update the UI components from the main thread
-            error_message = str(e)
-            
-            # FIX: Use self.login_panel and schedule reset after a small delay.
-            if self.login_panel:
-                self.after(0, self.login_panel.status_label.config, {'text': f"Error: {error_message}", 'foreground': '#FF0000'})
-                # Schedule the final reset command to run after any pending updates
-                self.after(50, self.login_panel.reset_fields) 
-            
-            agent.stop() # Ensure the failed agent is stopped
+            self.state.log(f"Login Fault: {e}", "error")
+            login_result[0] = False
+            login_done.set()
 
-    def _add_chat_tab(self, agent, first, last):
-        """Adds a new ChatTab to the notebook upon successful initial login."""
-        full_name = f"{first} {last}"
+    def _sync_state(self):
+        if self._hippo.position:
+            p = self._hippo.position
+            self.state.update_pos(p.X, p.Y, p.Z)
         
-        current_login_panel = self.login_panel # Get the current instance
+        if self._hippo.session and self._hippo.session.objects:
+            nearby = []
+            my_id = self._hippo.session.agent_id
+            for av in self._hippo.session.objects.all_avatars:
+                if av.FullID != my_id and av.RegionPosition:
+                    p = av.RegionPosition
+                    nearby.append({"x": float(p.X), "y": float(p.Y), "z": float(p.Z)})
+            self.state.update_nearby(nearby)
+
+    async def _send_agent_update(self, control_flags=0, rot_tuple=(0,0,0,1)):
+        if not self._hippo.main_circuit or not self._hippo.session: return
+        qx, qy, qz, qw = rot_tuple
+        pos = self._hippo.position or Vector3(128, 128, 0)
         
-        if full_name in self.active_agents:
-            # MODIFIED: Use ThemedMessageBox instead of messagebox.showwarning
-            ThemedMessageBox(self, "Already Logged In", f"Agent {full_name} is already logged in on another tab.", 'warning')
-            agent.stop() 
-            if current_login_panel:
-                # FIX: Schedule reset_fields for clean state
-                self.after(50, current_login_panel.reset_fields) 
-            return
-            
-        # 1. Create the new tab and give it the agent's name
-        chat_tab = ChatTab(self.notebook, agent, first, last, self)
-        tab_name = f"{first} {last}"
-        
-        # 2. Add to notebook and select it
-        self.notebook.add(chat_tab, text=tab_name)
-        self.notebook.select(chat_tab)
-        
-        # 3. Store the active agent
-        self.active_agents[full_name] = chat_tab
-        
-        # 4. Reset the Login Panel fields and UI state (progress bar and status)
-        if current_login_panel:
-            # FIX: Schedule reset_fields for clean state
-            self.after(50, current_login_panel.reset_fields)
+        msg = Message("AgentUpdate", Block("AgentData",
+            AgentID=self._hippo.session.agent_id, SessionID=self._hippo.session.id,
+            BodyRotation=Quaternion(qx, qy, qz, qw), HeadRotation=Quaternion(qx, qy, qz, qw),
+            State=0, CameraCenter=pos, CameraAtAxis=Vector3(1,0,0), CameraLeftAxis=Vector3(0,1,0),
+            CameraUpAxis=Vector3(0,0,1), Far=128.0, ControlFlags=int(control_flags), Flags=0))
+        self._hippo.main_circuit.send(msg)
 
-
-    def remove_tab(self, first_name, chat_tab_instance):
-        """Stops the agent and removes the corresponding tab."""
-        full_name = f"{first_name} {chat_tab_instance.my_last_name}"
-        
-        if full_name in self.active_agents:
-            # The agent is already stopped by the ChatTab.on_closing logic, 
-            # but ensure it's removed from the dictionary.
-            del self.active_agents[full_name]
-            self.notebook.forget(chat_tab_instance)
-            
-            # Select the "New Login" tab if it exists
-            if self.notebook.index('end') > 0:
-                self.notebook.select(0)
-
-    # --- Communication Handlers ---
-    def handle_debug_log(self, message):
-        """Central debug log handler (currently passive)."""
-        # This is where you could insert code to print debug messages or log them to a file.
-        # For now, we will simply pass, but the logic relies on this existing.
-        pass 
-
-    def handle_agent_update(self, update_type, message):
-        """
-        Central update handler. Directs progress updates to the LoginPanel.
-        All other updates are handled by the agent's assigned ChatTab.
-        """
-        if update_type == "progress":
-            # Only update the login panel's progress bar (index 0)
-            self.after(0, self._update_login_progress, message)
-        # All other updates (chat, status, teleport_offer, map_fetch_request, map_image_fetched) 
-        # are handled by the specific ChatTab via its own callbacks.
-
-    def _update_login_progress(self, message):
-        """Updates the progress bar in the LoginPanel safely."""
-        if self.login_panel:
-            step, value = message
-            self.login_panel.progress_bar.config(value=value)
-            
-            # Only update the status text if it's NOT the final successful message
-            if value < 100:
-                 self.login_panel.status_label.config(text=f"Login Step: {step}", foreground='#00FFFF')
-            
-    def on_closing(self):
-        """Handles closing the main window by logging out all agents."""
-        # FIX: If the window is minimized, restore it so the dialog can be seen.
-        if self.state() == 'iconic':
-            self.deiconify()
-            self.update()
-
-        # If no agents are logged in, close immediately without prompting
-        if not self.active_agents:
-            self.destroy()
-            return
-
-        # MODIFIED: Use ThemedMessageBox instead of messagebox.askyesno
-        dialog_result = ThemedMessageBox(self, "Quit", "Are you sure you want to log out all agents and exit?", 'yesno', topmost=True).result
-        
-        if dialog_result:
-            for agent in list(self.active_agents.values()):
-                agent.sl_agent.stop()
-            self.destroy()
-
-    def handle_global_return(self, event):
-        """
-        Handles the Enter key globally. 
-        If the current tab is the LoginPanel, trigger the login.
-        """
+    def _on_im(self, message):
         try:
-            # Check if active tab is the LoginPanel
-            # self.notebook.select() returns the widget name (path) of the selected tab
-            current_tab_id = self.notebook.select()
+            msg_block = message["MessageBlock"]
             
-            # self.login_panel is the actual widget object. str(self.login_panel) gives its path.
-            if self.login_panel and current_tab_id == str(self.login_panel):
-                 # Call start_login on the LoginPanel
-                 self.login_panel.start_login()
-        except Exception:
-            # In case of any weird focusing or widget state issues, just ignore
-            pass
+            try: msg_text = str(msg_block["Message"])
+            except KeyError: msg_text = ""
 
+            try: from_name = str(msg_block["FromAgentName"])
+            except KeyError: from_name = "Unknown"
+            
+            try: from_id = str(msg_block["FromAgentID"])
+            except KeyError:
+                try: from_id = str(message["AgentData"]["AgentID"])
+                except KeyError: from_id = "Unknown"
+
+            try: dialog = msg_block["Dialog"]
+            except KeyError: dialog = 0
+
+            if dialog == 0:
+                self.state.log(f"[IM] {from_name}: {msg_text}", "im", {"id": from_id})
+        except Exception as e:
+            self.state.log(f"IM Parse Exception: {e}", "error")
+
+    def _on_chat(self, m):
+        if m["ChatData"]["ChatType"] not in (ChatType.TYPING_START, ChatType.TYPING_STOP):
+            self.state.log(f"{m['ChatData']['FromName']}: {m['ChatData']['Message']}", "chat")
+
+    def _on_region_handshake(self, m):
+        name = str(m["RegionInfo"]["SimName"])
+        self.state.update_region(name)
+        self.state.log(f"Welcome to {name}", "system")
+        self._fetch_map()
+
+    def _on_teleport_finish(self, m):
+        handle = m["Info"]["RegionHandle"]
+        if handle:
+            gx = int((handle & 0xFFFFFFFF) / 256)
+            gy = int((handle >> 32) / 256)
+            self.state.update_region(self.state.current_region, gx, gy)
+            self.state.log(f"Teleport Complete. Grid: <{gx}, {gy}>", "success")
+            self._fetch_map()
+
+    def _on_object_update(self, m):
+        try:
+            td = float(m["RegionData"]["TimeDilation"]) / 65535.0
+            with self.state.lock:
+                self.state.time_dilation = td
+                self.state.sim_fps = td * 45.0
+        except: pass
+
+    def _fetch_map(self):
+        def _fetch_thread():
+            try:
+                with self.state.lock:
+                    gx, gy = self.state.grid_x, self.state.grid_y
+                
+                if gx == 0 or gy == 0: return
+
+                urls = [
+                    f"https://map.secondlife.com/map-1-{gx}-{gy}-objects.jpg",
+                    f"https://map.secondlife.com/map-1-{gx}-{gy}-base.jpg"
+                ]
+                headers = {'User-Agent': 'Mozilla/5.0'}
+                
+                success = False
+                for url in urls:
+                    try:
+                        req = urllib.request.Request(url, headers=headers)
+                        with urllib.request.urlopen(req) as response:
+                            data = response.read()
+                            if len(data) > 1000:
+                                with self.state.lock:
+                                    self.state.map_data = base64.b64encode(data).decode('utf-8')
+                                self.state.log("Map Visuals Acquired.", "success")
+                                success = True
+                                break
+                    except urllib.error.HTTPError as e:
+                        if e.code == 403: continue 
+                        raise e
+                    except Exception:
+                        pass
+                
+                if not success:
+                    self.state.log("Map Uplink Failed: Sim tiles are unrendered or void.", "error")
+
+            except Exception as e:
+                self.state.log(f"Map Uplink Fatal: {e}", "error")
+
+        threading.Thread(target=_fetch_thread, daemon=True).start()
+
+    def send_chat(self, message, chat_type=1, channel=0):
+        if not self.state.connected or not self._loop: return
+        if message.startswith("/im "):
+            parts = message.split(' ', 2)
+            if len(parts) >= 3:
+                self.send_im(parts[1], parts[2])
+                return
+                
+        ct = ChatType(chat_type) if isinstance(chat_type, int) else chat_type
+        
+        def _do_chat():
+            try:
+                self._hippo.send_chat(message, channel=channel, chat_type=ct)
+            except Exception as e:
+                self.state.log(f"Chat execution failed: {e}", "error")
+
+        self._loop.call_soon_threadsafe(_do_chat)
+        self.state.log(f"You: {message}", "chat_own")
+
+    def send_im(self, to_id, message):
+        async def _send():
+            msg = Message("ImprovedInstantMessage",
+                Block("AgentData", AgentID=self._hippo.session.agent_id, SessionID=self._hippo.session.id),
+                Block("MessageBlock", FromAgentName=self.state.full_name, ToAgentID=UUID(to_id),
+                    ParentEstateID=0, RegionID=UUID(), Position=self._hippo.position or Vector3(0,0,0),
+                    Offline=0, Dialog=0, ID=UUID(str(_uuid.uuid4())), Timestamp=int(time.time()),
+                    FromAgentID=self._hippo.session.agent_id, Message=message, BinaryBucket=b""))
+            self._hippo.main_circuit.send(msg)
+        asyncio.run_coroutine_threadsafe(_send(), self._loop)
+        self.state.log(f"To {to_id}: {message}", "im")
+
+    def teleport_local(self, x, y, z):
+        if not self.state.connected or not self._loop: return
+        with self.state.lock: gx, gy = self.state.grid_x, self.state.grid_y
+        handle = (gy * 256 << 32) | (gx * 256)
+
+        def _do_teleport():
+            try:
+                msg = Message("TeleportLocationRequest",
+                    Block("AgentData", AgentID=self._hippo.session.agent_id, SessionID=self._hippo.session.id),
+                    Block("Info", RegionHandle=handle, Position=Vector3(float(x), float(y), float(z)), LookAt=Vector3(float(x), float(y+1), float(z)))
+                )
+                self._hippo.main_circuit.send(msg)
+                self.state.log(f"Teleport to <{x}, {y}, {z}> dispatched.", "success")
+            except Exception as e:
+                self.state.log(f"Teleport request failed: {e}", "error")
+
+        self._loop.call_soon_threadsafe(_do_teleport)
+        self.state.log(f"Initializing Teleport Sequence to <{x}, {y}, {z}>...", "system")
+
+# ==========================================
+# SECTION 4: WEB SERVER
+# ==========================================
+
+client = HippoSLClient()
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BlackGlass OS v3.0</title>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+      }
+    </script>
+
+    <style>
+        :root {
+            --bg-color: #050505;
+            --win-bg: #111116;
+            --win-header: #1a1a20;
+            --accent: #00d4ff;
+            --text: #ececec;
+            --success: #00ff9d;
+            --err: #ff4757;
+            --im-color: #d000ff;
+            --taskbar-bg: #0a0a0a;
+            --border: #333;
+        }
+
+        * { box-sizing: border-box; user-select: none; }
+
+        body {
+            margin: 0;
+            font-family: 'Consolas', 'Monaco', monospace;
+            background: var(--bg-color);
+            color: var(--text);
+            height: 100vh;
+            overflow: hidden;
+            background-image: radial-gradient(circle at center, #111 0%, #000 100%);
+        }
+
+        #boot-screen {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: #000; z-index: 9999; padding: 40px;
+            font-size: 14px; color: #aaa;
+            display: flex; flex-direction: column;
+        }
+        .boot-line { margin-bottom: 5px; opacity: 0; animation: typeLine 0.1s forwards; }
+        @keyframes typeLine { to { opacity: 1; } }
+
+        #desktop {
+            position: absolute; top: 0; left: 0; width: 100%; height: calc(100% - 40px);
+            z-index: 1;
+        }
+
+        .window {
+            position: absolute;
+            background: var(--win-bg);
+            border: 1px solid var(--border);
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            display: flex; flex-direction: column;
+            opacity: 0; transform: scale(0.95);
+            transition: opacity 0.2s, transform 0.2s;
+            min-width: 300px; min-height: 200px;
+        }
+        .window.visible { opacity: 1; transform: scale(1); }
+
+        .window-header {
+            background: var(--win-header);
+            padding: 8px 10px;
+            display: flex; justify-content: space-between; align-items: center;
+            border-bottom: 1px solid var(--border);
+            cursor: grab;
+        }
+        .window-header:active { cursor: grabbing; }
+        .win-title { font-weight: bold; color: var(--accent); font-size: 0.9rem; text-transform: uppercase; letter-spacing: 1px; }
+        .win-controls span {
+            display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-left: 6px; cursor: pointer;
+        }
+        .ctrl-min { background: #f1c40f; }
+        .ctrl-max { background: #2ecc71; }
+        .ctrl-close { background: #e74c3c; }
+
+        .window-content { flex: 1; padding: 10px; overflow: hidden; position: relative; display: flex; flex-direction: column; }
+
+        #taskbar {
+            position: absolute; bottom: 0; left: 0; width: 100%; height: 40px;
+            background: var(--taskbar-bg); border-top: 1px solid var(--border);
+            display: flex; align-items: center; padding: 0 10px; z-index: 9000;
+        }
+        #start-btn {
+            background: var(--accent); color: #000; padding: 5px 15px; font-weight: bold; cursor: pointer; margin-right: 20px;
+        }
+        #start-menu {
+            position: absolute; bottom: 42px; left: 10px; width: 200px; background: var(--win-bg);
+            border: 1px solid var(--border); display: none; z-index: 9001;
+        }
+        .menu-item { padding: 10px; border-bottom: 1px solid #222; cursor: pointer; color: #aaa; }
+        .menu-item:hover { background: #222; color: #fff; }
+
+        .task-item {
+            padding: 5px 15px; background: #222; margin-right: 5px; cursor: pointer; border-bottom: 2px solid transparent; color: #888;
+        }
+        .task-item.active { border-bottom: 2px solid var(--accent); color: #fff; background: #333; }
+
+        #term-log { flex: 1; overflow-y: auto; font-size: 0.85rem; font-family: monospace; color: #0f0; }
+        .log-line { margin-bottom: 2px; }
+        .log-sys { color: #888; }
+        .log-err { color: var(--err); }
+        .log-suc { color: var(--success); }
+
+        #chat-history { flex: 1; overflow-y: auto; margin-bottom: 10px; background: #000; border: 1px solid #333; padding: 5px; }
+        .msg { margin-bottom: 4px; font-size: 0.9rem; word-wrap: break-word; }
+        .msg.chat { color: #ccc; }
+        .msg.chat_own { color: var(--accent); text-align: right; }
+        .msg.im { color: var(--im-color); border-left: 2px solid var(--im-color); padding-left: 5px; }
+        .reply-link { cursor: pointer; text-decoration: underline; font-size: 0.75em; margin-left: 5px; color: #fff; }
+
+        #chat-input-row { display: flex; gap: 5px; }
+        #chat-input { flex: 1; background: #000; border: 1px solid #444; color: #fff; padding: 5px; }
+        #chat-send { background: var(--accent); border: none; color: #000; font-weight: bold; cursor: pointer; padding: 0 15px; }
+
+        .login-field { margin-bottom: 10px; }
+        .login-field label { display: block; font-size: 0.8rem; color: #888; margin-bottom: 2px; }
+        .login-field input { width: 100%; background: #000; border: 1px solid #444; color: #fff; padding: 8px; }
+        #btn-login { width: 100%; padding: 10px; background: var(--accent); border: none; font-weight: bold; cursor: pointer; margin-top: 10px; }
+        #login-status { margin-top: 10px; font-size: 0.8rem; text-align: center; height: 20px; }
+
+        #three-container { width: 100%; height: 100%; background: #000; display: block; overflow: hidden; position: relative; }
+        #map-info { position: absolute; bottom: 5px; left: 5px; background: rgba(0,0,0,0.7); padding: 2px 5px; font-size: 0.8rem; z-index: 10; pointer-events: none; color: #fff; }
+
+        .tp-controls {
+            position: absolute; top: 10px; right: 10px; z-index: 20; display: flex; flex-direction: column; gap: 5px;
+        }
+        .tp-btn {
+            background: rgba(0, 212, 255, 0.2); border: 1px solid var(--accent); color: var(--accent);
+            font-weight: bold; cursor: pointer; padding: 5px 10px; font-size: 0.8rem; text-align: center;
+        }
+        .tp-btn:hover { background: var(--accent); color: #000; }
+
+        #radar-canvas { background: #000; width: 100%; height: 100%; border: 1px solid #333; }
+
+        .stat-row { display: flex; justify-content: space-between; border-bottom: 1px solid #222; padding: 5px 0; }
+        .stat-val { color: var(--accent); font-weight: bold; }
+
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #111; }
+        ::-webkit-scrollbar-thumb { background: #333; }
+        ::-webkit-scrollbar-thumb:hover { background: #555; }
+    </style>
+</head>
+<body>
+    <div id="boot-screen">
+        <div class="boot-line">BLACKGLASS BIOS v5.0 (HIPPOLYZER CORE)</div>
+        <div class="boot-line">CPU: Virtual x86 @ 4.0GHz</div>
+        <div class="boot-line">Initializing WebXR Subsystems...</div>
+        <div class="boot-line">Loading Reinforcement Learning Module...</div>
+        <div class="boot-line">System Ready.</div>
+    </div>
+
+    <div id="desktop" style="display:none;">
+        <div id="win-login" class="window" style="width: 300px; height: 380px; left: 50px; top: 50px; z-index: 100;">
+            <div class="window-header">
+                <div class="win-title">ID_AUTH_MODULE</div>
+                <div class="win-controls"><span class="ctrl-min"></span><span class="ctrl-close"></span></div>
+            </div>
+            <div class="window-content">
+                <div class="login-field">
+                    <label>FIRST NAME</label>
+                    <input type="text" id="inp-first" value="">
+                </div>
+                <div class="login-field">
+                    <label>LAST NAME</label>
+                    <input type="text" id="inp-last" value="">
+                </div>
+                <div class="login-field">
+                    <label>PASSPHRASE</label>
+                    <input type="password" id="inp-pass" value="">
+                </div>
+                <div class="login-field">
+                    <label>TARGET GRID LOC</label>
+                    <input type="text" id="inp-loc" value="last" placeholder="Region Name">
+                </div>
+                <button id="btn-login" onclick="app.login()">INITIALIZE UPLINK</button>
+                <div id="login-status">STANDBY</div>
+            </div>
+        </div>
+
+        <div id="win-term" class="window" style="width: 500px; height: 300px; right: 20px; top: 20px; z-index: 90;">
+            <div class="window-header">
+                <div class="win-title">SYS_LOG_TERMINAL</div>
+                <div class="win-controls"><span class="ctrl-min"></span><span class="ctrl-max"></span><span class="ctrl-close"></span></div>
+            </div>
+            <div class="window-content">
+                <div id="term-log"></div>
+            </div>
+        </div>
+
+        <div id="win-comm" class="window" style="width: 400px; height: 500px; left: 380px; top: 100px; z-index: 95; display: none;">
+            <div class="window-header">
+                <div class="win-title">COMM_UPLINK_V2</div>
+                <div class="win-controls"><span class="ctrl-min"></span><span class="ctrl-max"></span><span class="ctrl-close"></span></div>
+            </div>
+            <div class="window-content">
+                <div id="chat-history"></div>
+                <div id="chat-input-row">
+                    <input type="text" id="chat-input" placeholder="Transmit..." onkeypress="if(event.key==='Enter') app.sendChat()">
+                    <button id="chat-send" onclick="app.sendChat()">TX</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="win-map" class="window" style="width: 600px; height: 500px; right: 50px; bottom: 60px; z-index: 92; display: none;">
+            <div class="window-header">
+                <div class="win-title">CARTOGRAPHY_3D (AI)</div>
+                <div class="win-controls"><span class="ctrl-min"></span><span class="ctrl-max"></span><span class="ctrl-close"></span></div>
+            </div>
+            <div class="window-content" style="padding: 0;">
+                <div id="three-container"></div>
+                <div id="map-info">UNKNOWN SECTOR</div>
+                <div class="tp-controls">
+                    <div class="tp-btn" id="btn-neural" onclick="app.toggleNeural()">AI AUTOPILOT: OFF</div>
+                    <div class="tp-btn" style="border-color: #f0f;">CLICK TO TELEPORT</div>
+                </div>
+            </div>
+        </div>
+
+        <div id="win-radar" class="window" style="width: 250px; height: 250px; left: 20px; bottom: 60px; z-index: 93; display: none;">
+            <div class="window-header">
+                <div class="win-title">PROXIMITY_RADAR</div>
+                <div class="win-controls"><span class="ctrl-min"></span><span class="ctrl-max"></span><span class="ctrl-close"></span></div>
+            </div>
+            <div class="window-content">
+                <canvas id="radar-canvas"></canvas>
+            </div>
+        </div>
+
+        <div id="win-mon" class="window" style="width: 200px; height: 200px; left: 50px; top: 100px; z-index: 94; display: none;">
+            <div class="window-header">
+                <div class="win-title">SYS_MONITOR</div>
+                <div class="win-controls"><span class="ctrl-min"></span><span class="ctrl-close"></span></div>
+            </div>
+            <div class="window-content">
+                <div class="stat-row"><span>SIM FPS</span><span class="stat-val" id="stat-fps">--</span></div>
+                <div class="stat-row"><span>DILATION</span><span class="stat-val" id="stat-dil">--</span></div>
+                <div class="stat-row"><span>PING</span><span class="stat-val" id="stat-ping">--</span></div>
+                <div class="stat-row"><span>COORDS</span><span class="stat-val" id="stat-pos">--</span></div>
+            </div>
+        </div>
+    </div>
+
+    <div id="taskbar" style="display:none;">
+        <div id="start-btn" onclick="wm.toggleStart()">:: SYSTEM</div>
+        <div class="task-item active" id="task-auth" onclick="wm.focus('win-login')">AUTH</div>
+        <div class="task-item" id="task-term" onclick="wm.focus('win-term')">TERMINAL</div>
+        <div class="task-item" onclick="wm.focus('win-comm')" id="task-comm" style="display:none;">COMMS</div>
+        <div class="task-item" onclick="wm.focus('win-map')" id="task-map" style="display:none;">MAP</div>
+        <div class="task-item" onclick="wm.focus('win-radar')" id="task-radar" style="display:none;">RADAR</div>
+        <div class="task-item" onclick="wm.focus('win-mon')" id="task-mon" style="display:none;">MON</div>
+        <div style="margin-left: auto; font-size: 0.8rem; color: #666;" id="clock">00:00:00</div>
+    </div>
+
+    <div id="start-menu">
+        <div class="menu-item" onclick="wm.open('win-term')">SYSTEM LOGS</div>
+        <div class="menu-item" onclick="wm.open('win-comm')">COMMUNICATIONS</div>
+        <div class="menu-item" onclick="wm.open('win-map')">CARTOGRAPHY (VR)</div>
+        <div class="menu-item" onclick="wm.open('win-radar')">RADAR SCANNER</div>
+        <div class="menu-item" onclick="wm.open('win-mon')">PERFORMANCE</div>
+        <div class="menu-item" onclick="wm.open('win-login')">RE-AUTHENTICATE</div>
+        <div class="menu-item" style="border-top: 1px solid #444; color: #ff4757;" onclick="location.reload()">SHUTDOWN</div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { VRButton } from 'three/addons/webxr/VRButton.js';
+
+        const wm = {
+            zIndex: 100,
+            windows: document.querySelectorAll('.window'),
+            init() {
+                this.windows.forEach(win => {
+                    this.makeDraggable(win);
+                    win.addEventListener('mousedown', () => this.focus(win.id));
+                    win.querySelector('.ctrl-close').onclick = () => this.close(win.id);
+                    win.querySelector('.ctrl-min').onclick = () => this.minimize(win.id);
+                });
+            },
+            focus(id) {
+                const win = document.getElementById(id);
+                if(win.style.display === 'none' || win.style.display === '') {
+                    win.style.display = 'flex';
+                    setTimeout(() => win.classList.add('visible'), 10);
+                }
+                win.style.zIndex = ++this.zIndex;
+                document.getElementById('start-menu').style.display = 'none';
+                this.updateTaskbar(id);
+            },
+            updateTaskbar(winId) {
+                document.querySelectorAll('.task-item').forEach(t => t.classList.remove('active'));
+                const map = {'win-login':'task-auth','win-term':'task-term','win-comm':'task-comm','win-map':'task-map','win-radar':'task-radar','win-mon':'task-mon'};
+                const taskId = map[winId];
+                if(taskId) {
+                    const taskEl = document.getElementById(taskId);
+                    if(taskEl) taskEl.classList.add('active');
+                }
+            },
+            open(id) {
+                this.focus(id);
+                const taskID = id.replace('win-', 'task-');
+                const taskEl = document.getElementById(taskID);
+                if(taskEl) taskEl.style.display = 'block';
+            },
+            close(id) {
+                const win = document.getElementById(id);
+                win.classList.remove('visible');
+                setTimeout(() => win.style.display = 'none', 200);
+            },
+            minimize(id) { this.close(id); },
+            toggleStart() {
+                const menu = document.getElementById('start-menu');
+                menu.style.display = menu.style.display === 'block' ? 'none' : 'block';
+            },
+            makeDraggable(el) {
+                let pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;
+                const header = el.querySelector('.window-header');
+                header.onmousedown = dragMouseDown;
+                function dragMouseDown(e) {
+                    e = e || window.event;
+                    e.preventDefault();
+                    pos3 = e.clientX;
+                    pos4 = e.clientY;
+                    document.onmouseup = closeDragElement;
+                    document.onmousemove = elementDrag;
+                    wm.focus(el.id);
+                }
+                function elementDrag(e) {
+                    e = e || window.event;
+                    e.preventDefault();
+                    pos1 = pos3 - e.clientX;
+                    pos2 = pos4 - e.clientY;
+                    pos3 = e.clientX;
+                    pos4 = e.clientY;
+                    el.style.top = (el.offsetTop - pos2) + "px";
+                    el.style.left = (el.offsetLeft - pos1) + "px";
+                }
+                function closeDragElement() {
+                    document.onmouseup = null;
+                    document.onmousemove = null;
+                }
+            }
+        };
+
+        const app = {
+            msgCount: 0,
+            controls: 0,
+            scene: null,
+            camera: null,
+            renderer: null,
+            mapPlane: null,
+            avatars: [],
+            lastMapData: null,
+            raycaster: new THREE.Raycaster(),
+            mouse: new THREE.Vector2(),
+            neuralActive: false,
+
+            async login() {
+                const btn = document.getElementById('btn-login');
+                const stat = document.getElementById('login-status');
+                btn.disabled = true;
+                stat.innerText = "HANDSHAKING...";
+                stat.style.color = "#00d4ff";
+
+                const res = await fetch('/api/login', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        first: document.getElementById('inp-first').value,
+                        last: document.getElementById('inp-last').value,
+                        pass: document.getElementById('inp-pass').value,
+                        start: document.getElementById('inp-loc').value
+                    })
+                });
+                const data = await res.json();
+
+                if(data.success) {
+                    stat.innerText = "UPLINK ESTABLISHED";
+                    stat.style.color = "#00ff9d";
+                    setTimeout(() => {
+                        wm.close('win-login');
+                        this.openSession();
+                    }, 1000);
+                } else {
+                    stat.innerText = "ACCESS DENIED";
+                    stat.style.color = "#ff4757";
+                    btn.disabled = false;
+                }
+            },
+
+            openSession() {
+                ['win-comm', 'win-map', 'win-radar', 'win-mon'].forEach(id => wm.open(id));
+                setTimeout(() => this.initThree(), 100);
+            },
+
+            async sendChat() {
+                const input = document.getElementById('chat-input');
+                if(!input.value) return;
+                await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({msg: input.value})
+                });
+                input.value = "";
+            },
+
+            async teleportLocal(x, y, z) {
+                await fetch('/api/teleport', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({region: "local", x: x, y: y, z: z})
+                });
+                wm.open('win-comm');
+            },
+
+            setReply(id) {
+                const input = document.getElementById('chat-input');
+                input.value = "/im " + id + " ";
+                input.focus();
+            },
+
+            toggleNeural() {
+                this.neuralActive = !this.neuralActive;
+                fetch('/api/neural', { method: 'POST' });
+                const btn = document.getElementById('btn-neural');
+                if(this.neuralActive) {
+                    btn.innerText = "AI AUTOPILOT: ON";
+                    btn.style.background = "#00ff9d";
+                    btn.style.color = "#000";
+                } else {
+                    btn.innerText = "AI AUTOPILOT: OFF";
+                    btn.style.background = "";
+                    btn.style.color = "";
+                }
+            },
+
+            initThree() {
+                if (this.renderer) return;
+                const container = document.getElementById('three-container');
+                const width = container.clientWidth || 600;
+                const height = container.clientHeight || 500;
+
+                this.scene = new THREE.Scene();
+                this.scene.background = new THREE.Color(0x111116);
+                this.scene.fog = new THREE.Fog(0x111116, 50, 200);
+
+                this.camera = new THREE.PerspectiveCamera(60, width / height, 0.1, 500);
+                this.camera.position.set(128, 100, 180);
+                this.camera.lookAt(128, 0, 128);
+
+                this.renderer = new THREE.WebGLRenderer({ antialias: true });
+                this.renderer.setSize(width, height);
+                this.renderer.xr.enabled = true;
+                container.appendChild(this.renderer.domElement);
+                container.appendChild(VRButton.createButton(this.renderer));
+
+                const controls = new OrbitControls(this.camera, this.renderer.domElement);
+                controls.target.set(128, 0, 128);
+                controls.update();
+
+                const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+                this.scene.add(ambientLight);
+                const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+                dirLight.position.set(0, 100, 50);
+                this.scene.add(dirLight);
+
+                const geometry = new THREE.PlaneGeometry(256, 256);
+                geometry.rotateX(-Math.PI / 2);
+                geometry.translate(128, 0, 128);
+
+                const material = new THREE.MeshStandardMaterial({
+                    color: 0x444444,
+                    roughness: 0.8,
+                    metalness: 0.2
+                });
+                this.mapPlane = new THREE.Mesh(geometry, material);
+                this.scene.add(this.mapPlane);
+
+                const gridHelper = new THREE.GridHelper(256, 16, 0x00d4ff, 0x333333);
+                gridHelper.position.set(128, 0.1, 128);
+                this.scene.add(gridHelper);
+
+                this.renderer.domElement.addEventListener('click', (event) => {
+                    const rect = this.renderer.domElement.getBoundingClientRect();
+                    this.mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+                    this.mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+                    this.raycaster.setFromCamera(this.mouse, this.camera);
+                    const intersects = this.raycaster.intersectObjects([this.mapPlane, ...this.avatars]);
+
+                    if (intersects.length > 0) {
+                        const pt = intersects[0].point;
+                        console.log("Teleporting to", pt);
+                        this.teleportLocal(pt.x, pt.z, 25);
+                    }
+                });
+
+                new ResizeObserver(() => {
+                    const w = container.clientWidth;
+                    const h = container.clientHeight;
+                    if (w > 0 && h > 0) {
+                        this.renderer.setSize(w, h);
+                        this.camera.aspect = w / h;
+                        this.camera.updateProjectionMatrix();
+                    }
+                }).observe(container);
+
+                this.animateThree();
+            },
+
+            updateMapTexture(base64Data) {
+                if (!this.scene || base64Data === this.lastMapData) return;
+                this.lastMapData = base64Data;
+
+                const image = new Image();
+                image.src = "data:image/jpeg;base64," + base64Data;
+                image.onload = () => {
+                    const texture = new THREE.Texture(image);
+                    texture.needsUpdate = true;
+                    this.mapPlane.material.map = texture;
+                    this.mapPlane.material.needsUpdate = true;
+                    this.mapPlane.material.color.setHex(0xffffff);
+                };
+            },
+
+            updateAvatars(nearbyList) {
+                if (!this.scene) return;
+                this.avatars.forEach(m => this.scene.remove(m));
+                this.avatars = [];
+
+                nearbyList.forEach(av => {
+                    const geometry = new THREE.CapsuleGeometry(1, 2, 4, 8);
+                    const material = new THREE.MeshStandardMaterial({ color: 0xff00ff, emissive: 0x440044 });
+                    const mesh = new THREE.Mesh(geometry, material);
+                    mesh.position.set(av.x, av.z/2 + 2, av.y);
+                    mesh.userData = { x: av.x, y: av.y };
+                    this.scene.add(mesh);
+                    this.avatars.push(mesh);
+                });
+            },
+
+            animateThree() {
+                this.renderer.setAnimationLoop(() => {
+                    this.renderer.render(this.scene, this.camera);
+                });
+            },
+
+            drawRadar(avatars) {
+                const canvas = document.getElementById('radar-canvas');
+                const ctx = canvas.getContext('2d');
+                canvas.width = canvas.parentElement.clientWidth;
+                canvas.height = canvas.parentElement.clientHeight;
+                const cx = canvas.width / 2;
+                const cy = canvas.height / 2;
+
+                ctx.fillStyle = '#000';
+                ctx.fillRect(0,0, canvas.width, canvas.height);
+
+                ctx.strokeStyle = '#003300';
+                ctx.beginPath(); ctx.arc(cx, cy, 30, 0, 7); ctx.stroke();
+                ctx.beginPath(); ctx.arc(cx, cy, 60, 0, 7); ctx.stroke();
+                ctx.beginPath(); ctx.arc(cx, cy, 90, 0, 7); ctx.stroke();
+
+                ctx.fillStyle = '#00ff00';
+                ctx.beginPath(); ctx.arc(cx, cy, 3, 0, 7); ctx.fill();
+
+                avatars.forEach(av => {
+                    const px = (av.x / 256) * canvas.width;
+                    const py = ((256-av.y) / 256) * canvas.height;
+
+                    ctx.fillStyle = '#ff00ff';
+                    ctx.beginPath(); ctx.arc(px, py, 4, 0, 7); ctx.fill();
+                });
+            },
+
+            poll: async function() {
+                try {
+                    const res = await fetch('/api/poll');
+                    const data = await res.json();
+
+                    const term = document.getElementById('term-log');
+                    const chat = document.getElementById('chat-history');
+
+                    if (data.messages.length > this.msgCount) {
+                        for (let i = this.msgCount; i < data.messages.length; i++) {
+                            const m = data.messages[i];
+                            if (['system', 'error', 'success'].includes(m.type)) {
+                                const div = document.createElement('div');
+                                div.className = 'log-line';
+                                if(m.type === 'error') div.className += ' log-err';
+                                if(m.type === 'success') div.className += ' log-suc';
+                                if(m.type === 'system') div.className += ' log-sys';
+                                div.innerText = `[${m.time}] ${m.text}`;
+                                term.appendChild(div);
+                                term.scrollTop = term.scrollHeight;
+                            }
+                            if (['chat', 'chat_own', 'im'].includes(m.type)) {
+                                const div = document.createElement('div');
+                                div.className = `msg ${m.type}`;
+                                let content = `[${m.time}] ${m.text}`;
+                                if(m.type === 'im' && m.meta && m.meta.id) {
+                                    content += ` <span class="reply-link" onclick="app.setReply('${m.meta.id}')">[REPLY]</span>`;
+                                }
+                                div.innerHTML = content;
+                                chat.appendChild(div);
+                                chat.scrollTop = chat.scrollHeight;
+                            }
+                        }
+                        this.msgCount = data.messages.length;
+                    }
+
+                    if (data.map) this.updateMapTexture(data.map);
+                    if (data.nearby) this.updateAvatars(data.nearby);
+
+                    if(data.region && data.region !== "Unknown") {
+                        document.getElementById('map-info').innerText = "SECTOR: " + data.region;
+                    }
+
+                    this.drawRadar(data.nearby);
+
+                    document.getElementById('stat-fps').innerText = data.stats.fps.toFixed(1);
+                    document.getElementById('stat-dil').innerText = data.stats.dilation.toFixed(2);
+                    document.getElementById('stat-pos').innerText = `<${data.stats.pos.x.toFixed(0)}, ${data.stats.pos.y.toFixed(0)}>`;
+
+                } catch (e) { console.error(e); }
+            }
+        };
+
+        window.onload = () => {
+            window.app = app;
+            window.wm = wm;
+
+            let lines = document.querySelectorAll('.boot-line');
+            let delay = 0;
+            lines.forEach((line) => {
+                setTimeout(() => line.style.opacity = 1, delay);
+                delay += (Math.random() * 500) + 200;
+            });
+            setTimeout(() => {
+                document.getElementById('boot-screen').style.display = 'none';
+                document.getElementById('desktop').style.display = 'block';
+                document.getElementById('taskbar').style.display = 'flex';
+                wm.init();
+                setTimeout(() => wm.focus('win-login'), 100);
+                setTimeout(() => wm.focus('win-term'), 300);
+
+                setInterval(() => {
+                    document.getElementById('clock').innerText = new Date().toLocaleTimeString();
+                }, 1000);
+                setInterval(() => app.poll(), 500);
+            }, delay + 800);
+        };
+    </script>
+</body>
+</html>
+"""
+
+class WebHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get('Content-Length', 0))
+        if length > 0:
+            body = json.loads(self.rfile.read(length))
+        else:
+            body = {}
+            
+        res = {"success": False}
+        if self.path == '/api/login':
+            res["success"] = client.login(body['first'], body['last'], body['pass'], body['start'])
+        elif self.path == '/api/chat':
+            client.send_chat(body['msg']); res["success"] = True
+        elif self.path == '/api/teleport':
+            if body.get('region') == 'local':
+                client.teleport_local(body['x'], body['y'], body['z'])
+            else:
+                client.log(f"Teleporting to {body['region']}...", "system")
+            res["success"] = True
+        elif self.path == '/api/neural':
+            active = client.neural.toggle()
+            client.log(f"NEURAL AUTOPILOT {'ACTIVE' if active else 'DISENGAGED'}", "system")
+            res["success"] = True
+            
+        self.send_response(200); self.send_header('Content-type', 'application/json'); self.end_headers()
+        self.wfile.write(json.dumps(res).encode('utf-8'))
+
+    def do_GET(self):
+        if self.path == '/api/poll':
+            self.send_response(200); self.send_header('Content-type', 'application/json'); self.end_headers()
+            self.wfile.write(json.dumps(client.state.snapshot()).encode('utf-8'))
+        else:
+            self.send_response(200); self.send_header('Content-type', 'text/html'); self.end_headers()
+            self.wfile.write(HTML_TEMPLATE.encode('utf-8'))
+    
+    def log_message(self, format, *args): return
 
 if __name__ == "__main__":
-    # Ensure the credentials file exists
-    if not os.path.exists(CREDENTIALS_FILE):
-        try:
-            with open(CREDENTIALS_FILE, 'w') as f:
-                f.write('[]')
-        except:
-            print(f"Warning: Could not create {CREDENTIALS_FILE}. Credentials will not be saved.")
-            
-    app = MultiClientApp()
-    app.mainloop()
+    print("HYPER-CORE [DEEP-FIX V6] LOADED. PORT 8080")
+    HTTPServer(('0.0.0.0', 8080), WebHandler).serve_forever()
