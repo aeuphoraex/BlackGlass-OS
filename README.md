@@ -4,7 +4,7 @@ Here is the updated `README.md`, Curtis. The documentation now reflects the mass
 
 # BlackGlass OS (Hyper-Core)
 
-<img width="256" height="256" alt="image" src="[https://github.com/user-attachments/assets/0bfe5e2b-0043-466c-afc4-141d5138b68d](https://github.com/user-attachments/assets/0bfe5e2b-0043-466c-afc4-141d5138b68d)" />
+<img width="256" height="256" alt="image" src="https://github.com/user-attachments/assets/0bfe5e2b-0043-466c-afc4-141d5138b68d" />
 
 BlackGlass is an advanced, high-performance headless Second Life client and multi-agent controller. Evolving from a legacy desktop application, BlackGlass now operates as a sleek, browser-based virtual operating system (BlackGlass OS). It is specifically engineered for multi-client chat management, WebXR cartography, and autonomous agent routing, making it the perfect backbone for managing automated bot fleets and immersive experiences like DUBWARZ.
 
@@ -45,7 +45,7 @@ The UI features a high-contrast "BlackGlass" hacker aesthetic:
 * Interactive Taskbar & Start Menu for rapid module switching.
 * Real-time telemetry tracking Sim FPS, Time Dilation, and precise local Grid Coordinates.
 
-<img width="796" height="677" alt="image" src="[https://github.com/user-attachments/assets/b0b95f37-ebe5-4bf9-89fa-7189834cf80e](https://github.com/user-attachments/assets/b0b95f37-ebe5-4bf9-89fa-7189834cf80e)" />
+<img width="796" height="677" alt="image" src="https://github.com/user-attachments/assets/b0b95f37-ebe5-4bf9-89fa-7189834cf80e" />
 
 # 🛠️ Requirements
 
