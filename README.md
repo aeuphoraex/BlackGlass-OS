@@ -1,7 +1,3 @@
-Here is the updated `README.md`, Curtis. The documentation now reflects the massive architectural leap from the legacy desktop app to the web-based Hyper-Core, perfectly framing it for your multi-agent setups and DUBWARZ deployments.
-
----
-
 # BlackGlass OS (Hyper-Core)
 
 <img width="256" height="256" alt="image" src="https://github.com/user-attachments/assets/0bfe5e2b-0043-466c-afc4-141d5138b68d" />
